@@ -20,6 +20,8 @@ import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedi
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const INTERNAL_TOKEN = crypto.randomBytes(24).toString('hex');
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
+const STATUS_FILE = path.join(DATA_DIR, 'status.json');
+const QR_FILE = path.join(DATA_DIR, 'qr.png');
 
 // Persist internal token for send.js
 try {
@@ -27,6 +29,18 @@ try {
   fs.writeFileSync(TOKEN_FILE, INTERNAL_TOKEN, { mode: 0o600 });
 } catch (err) {
   console.error(`[whatsapp] Failed to write internal token: ${err.message}`);
+}
+
+/**
+ * Write connection status to status.json for external monitoring (e.g. provision service).
+ */
+function writeStatus(state, extra = {}) {
+  try {
+    const data = { state, updatedAt: new Date().toISOString(), ...extra };
+    fs.writeFileSync(STATUS_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error(`[whatsapp] Failed to write status: ${err.message}`);
+  }
 }
 
 // Ensure directories
@@ -270,24 +284,31 @@ watchConfig((newConfig) => {
 });
 
 // Connect to WhatsApp
+writeStatus('connecting');
 connect({
   onMessage: handleMessage,
   onQr: async (qr) => {
-    const qrPath = path.join(DATA_DIR, 'qr.png');
     try {
-      await QRCode.toFile(qrPath, qr, { width: 512 });
-      console.log(`[whatsapp] QR code saved to ${qrPath}. Scan with your phone to login.`);
+      await QRCode.toFile(QR_FILE, qr, { width: 512 });
+      writeStatus('qr_waiting');
+      console.log(`[whatsapp] QR code saved to ${QR_FILE}. Scan with your phone to login.`);
     } catch (err) {
       console.error(`[whatsapp] Failed to save QR: ${err.message}`);
     }
   },
   onConnected: (user) => {
+    const phoneNumber = user?.id ? '+' + String(user.id).split(':')[0].split('@')[0] : undefined;
+    writeStatus('open', { phoneNumber });
+    // Remove stale QR file
+    try { fs.unlinkSync(QR_FILE); } catch { /* ignore */ }
     console.log(`[whatsapp] Successfully connected as ${user?.id}`);
   },
   onDisconnected: (statusCode) => {
+    writeStatus('disconnected', { statusCode });
     console.log(`[whatsapp] Disconnected (status: ${statusCode})`);
   }
 }).catch(err => {
+  writeStatus('disconnected', { error: err.message });
   console.error(`[whatsapp] Fatal connection error: ${err.message}`);
   process.exit(1);
 });
