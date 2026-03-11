@@ -5,9 +5,11 @@
  */
 
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from 'baileys';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import path from 'path';
 import fs from 'fs';
-import { DATA_DIR } from './config.js';
+import { DATA_DIR, getConfig } from './config.js';
 
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
 
@@ -36,6 +38,13 @@ export function getSelfJid() {
 }
 
 /**
+ * Get self LID (Linked Identity)
+ */
+export function getSelfLid() {
+  return sock?.user?.lid || null;
+}
+
+/**
  * Connect to WhatsApp Web
  * @param {Object} options
  * @param {Function} options.onMessage - Callback for incoming messages
@@ -49,10 +58,22 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   connectionState = 'connecting';
 
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true
-  });
+  // Override Baileys hardcoded version to avoid 405 protocol mismatch
+  const WA_VERSION = [2, 3000, 1034074495];
+  const socketOpts = { auth: state, printQRInTerminal: true, version: WA_VERSION };
+
+  // Use SOCKS5 proxy if configured (to bypass datacenter IP blocking)
+  const cfg = getConfig();
+  const proxyUrl = cfg.proxy || process.env.WHATSAPP_PROXY;
+  if (proxyUrl) {
+    const isSocks = proxyUrl.startsWith('socks');
+    const agent = isSocks ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
+    socketOpts.agent = agent;
+    socketOpts.fetchAgent = agent;
+    console.log(`[whatsapp] Using ${isSocks ? 'SOCKS' : 'HTTP'} proxy: ${proxyUrl.replace(/\/\/.*@/, '//***@')}`);
+  }
+
+  sock = makeWASocket(socketOpts);
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -92,8 +113,15 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
     for (const msg of event.messages) {
       // Skip status broadcasts
       if (msg.key.remoteJid === 'status@broadcast') continue;
-      // Skip messages sent by us
-      if (msg.key.fromMe) continue;
+      // Skip messages sent by us (except self-chat / "Message Yourself")
+      const selfId = sock?.user?.id;
+      const selfNum = selfId ? String(selfId).split(':')[0].split('@')[0] : null;
+      const selfLid = sock?.user?.lid;
+      const selfLidNum = selfLid ? String(selfLid).split(':')[0].split('@')[0] : null;
+      const remoteNum = msg.key.remoteJid ? String(msg.key.remoteJid).split(':')[0].split('@')[0] : null;
+      const isSelfChat = (selfNum && remoteNum && selfNum === remoteNum) ||
+                         (selfLidNum && remoteNum && selfLidNum === remoteNum);
+      if (msg.key.fromMe && !isSelfChat) continue;
       // Skip protocol messages (reactions, receipts, etc.)
       if (!msg.message) continue;
 

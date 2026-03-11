@@ -10,11 +10,12 @@ import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import QRCode from 'qrcode';
 
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig, watchConfig, saveConfig, stopWatching, DATA_DIR } from './lib/config.js';
-import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedia, getSelfJid } from './lib/whatsapp.js';
+import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedia, getSelfJid, getSelfLid } from './lib/whatsapp.js';
 
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const INTERNAL_TOKEN = crypto.randomBytes(24).toString('hex');
@@ -100,8 +101,17 @@ function checkAccess(config, senderJid, chatJid, isGroupMsg) {
   const senderPhone = jidToPhone(senderJid);
   const ownerJid = config.owner?.jid;
 
+  // Self-chat ("Message Yourself") is always allowed — it's the account owner by definition
+  const selfLid = getSelfLid();
+  const selfLidNum = selfLid ? String(selfLid).split(':')[0].split('@')[0] : null;
+  const senderNum = String(senderJid).split(':')[0].split('@')[0];
+  const chatNum = String(chatJid).split(':')[0].split('@')[0];
+  if (selfLidNum && (selfLidNum === senderNum || selfLidNum === chatNum)) {
+    return true;
+  }
+
   // Owner always allowed
-  if (ownerJid && String(senderJid).split(':')[0].split('@')[0] === String(ownerJid).split(':')[0].split('@')[0]) {
+  if (ownerJid && senderNum === String(ownerJid).split(':')[0].split('@')[0]) {
     return true;
   }
 
@@ -143,12 +153,17 @@ async function handleMessage(msg) {
   const isGroupMsg = isGroup(chatJid);
   const senderJid = isGroupMsg ? msg.key.participant : chatJid;
 
-  // Self-message check
+  // Self-message check: allow self-chat ("Message Yourself") but skip echoes in other chats
   const selfJid = getSelfJid();
+  const selfLid = getSelfLid();
   if (selfJid && senderJid) {
     const selfNum = String(selfJid).split(':')[0].split('@')[0];
+    const selfLidNum = selfLid ? String(selfLid).split(':')[0].split('@')[0] : null;
     const senderNum = String(senderJid).split(':')[0].split('@')[0];
-    if (selfNum === senderNum) return;
+    const chatNum = String(chatJid).split(':')[0].split('@')[0];
+    const isSelfChat = (selfNum === chatNum) || (selfLidNum && selfLidNum === chatNum);
+    const isSelf = (selfNum === senderNum) || (selfLidNum && selfLidNum === senderNum);
+    if (isSelf && !isSelfChat) return;
   }
 
   // Owner auto-bind (first DM)
@@ -257,8 +272,14 @@ watchConfig((newConfig) => {
 // Connect to WhatsApp
 connect({
   onMessage: handleMessage,
-  onQr: (qr) => {
-    console.log('[whatsapp] QR code generated. Scan with your phone to login.');
+  onQr: async (qr) => {
+    const qrPath = path.join(DATA_DIR, 'qr.png');
+    try {
+      await QRCode.toFile(qrPath, qr, { width: 512 });
+      console.log(`[whatsapp] QR code saved to ${qrPath}. Scan with your phone to login.`);
+    } catch (err) {
+      console.error(`[whatsapp] Failed to save QR: ${err.message}`);
+    }
   },
   onConnected: (user) => {
     console.log(`[whatsapp] Successfully connected as ${user?.id}`);
