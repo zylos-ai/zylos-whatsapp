@@ -1,6 +1,6 @@
 ---
 name: whatsapp
-version: 0.1.0
+version: 0.1.1
 description: >-
   WhatsApp communication channel via WhatsApp Web protocol (QR code login).
   Use when: (1) replying to WhatsApp messages (DM or group),
