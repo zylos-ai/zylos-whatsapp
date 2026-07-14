@@ -4,9 +4,10 @@
  * Handles: QR auth, persistent sessions, message send/receive.
  */
 
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestWaWebVersion } from 'baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from 'baileys';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import https from 'https';
 import path from 'path';
 import fs from 'fs';
 import { DATA_DIR, getConfig } from './config.js';
@@ -44,39 +45,107 @@ export function getSelfLid() {
   return sock?.user?.lid || null;
 }
 
+const WA_WEB_SW_URL = 'https://web.whatsapp.com/sw.js';
+const VERSION_FETCH_TIMEOUT_MS = 15000;
+
+/**
+ * Fetch web.whatsapp.com/sw.js through the SAME proxy agent the socket uses
+ * (Baileys' fetchLatestWaWebVersion() does a bare global fetch, which bypasses
+ * cfg.proxy / WHATSAPP_PROXY and has no timeout — on proxy-required
+ * deployments it would hang or fail while the direct path is blocked).
+ *
+ * @param {import('http').Agent} [agent] - proxy agent, or undefined for direct
+ * @returns {Promise<string>} sw.js body
+ */
+async function fetchSwJs(agent) {
+  let req;
+  const attempt = new Promise((resolve, reject) => {
+    req = https.get(WA_WEB_SW_URL, {
+      agent,
+      headers: {
+        // Minimal headers Baileys' own helper sends to bypass anti-bot detection
+        'sec-fetch-site': 'none',
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      }
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode} fetching ${WA_WEB_SW_URL}`));
+        req.destroy();
+        return;
+      }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve(body));
+    });
+    req.on('error', reject);
+  });
+  // If the timeout wins the race, the attempt may still settle later — keep
+  // its rejection handled so it cannot crash the process.
+  attempt.catch(() => {});
+  // Wall-clock timeout as a racing promise: while a proxy agent is still
+  // awaiting its CONNECT, the request has no socket, so neither AbortSignal
+  // nor req.destroy() produces an 'error' event — a request-side timeout
+  // would never fire.
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      req.destroy();
+      reject(new Error(`timed out after ${VERSION_FETCH_TIMEOUT_MS}ms fetching ${WA_WEB_SW_URL}`));
+    }, VERSION_FETCH_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([attempt, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Resolve the WA Web version to advertise to WhatsApp servers.
  *
- * Fetches the current version from web.whatsapp.com via Baileys'
- * fetchLatestWaWebVersion(). On failure it falls back to the Baileys bundled
- * default — but never silently: the fallback is logged at error level because
- * a stale version can cause new QR/pairing registrations to be rejected
- * (405/408).
+ * Fetches the current version from web.whatsapp.com through the given proxy
+ * agent (same egress as the socket), with an explicit timeout. Behavior on
+ * fetch failure depends on whether a registered session exists:
+ * - fresh auth (required=true): throw — pairing with the stale Baileys bundled
+ *   version is a known 405/408 failure class, so refuse to attempt it and
+ *   surface an actionable error instead.
+ * - existing session (required=false): return undefined so Baileys resumes the
+ *   session with its bundled default — allowed degradation, logged loudly.
  *
- * @returns {Promise<number[]>} WA Web version tuple, e.g. [2, 3000, 1043113828]
+ * @param {Object} opts
+ * @param {import('http').Agent} [opts.agent] - proxy agent, or undefined for direct
+ * @param {boolean} opts.required - true when no registered session exists (fresh auth)
+ * @returns {Promise<number[]|undefined>} WA Web version tuple, e.g. [2, 3000, 1043113828]
  */
-async function resolveWaWebVersion() {
+async function resolveWaWebVersion({ agent, required }) {
   try {
-    const { version, isLatest, error } = await fetchLatestWaWebVersion();
-    if (error || !isLatest) {
-      // Baileys returns its bundled default version alongside the error
-      const errMsg = error?.message || String(error) || 'unknown error';
-      console.error(
-        `[whatsapp] Failed to fetch latest WA Web version: ${errMsg}; ` +
-        `falling back to Baileys bundled ${version.join('.')} which may be stale ` +
-        `and can cause pairing failures (405/408)`
-      );
-    } else {
-      console.log(`[whatsapp] Using WA Web version ${version.join('.')} (fetched from web.whatsapp.com)`);
+    const body = await fetchSwJs(agent);
+    // Same extraction as Baileys' fetchLatestWaWebVersion()
+    const match = body.match(/\\?"client_revision\\?":\s*(\d+)/);
+    if (!match?.[1]) {
+      throw new Error('could not find client_revision in sw.js');
     }
+    const version = [2, 3000, Number(match[1])];
+    console.log(
+      `[whatsapp] Using WA Web version ${version.join('.')} ` +
+      `(fetched from web.whatsapp.com${agent ? ' via proxy' : ''})`
+    );
     return version;
   } catch (err) {
-    // fetchLatestWaWebVersion should not throw, but guard anyway: let Baileys
-    // use its bundled default by returning undefined — loudly.
+    if (required) {
+      throw new Error(
+        `cannot determine the current WA Web version (${err.message}) and no registered ` +
+        `session exists. Refusing to attempt fresh QR pairing with the stale Baileys ` +
+        `bundled version — WhatsApp rejects registrations from stale clients (405/408). ` +
+        `Check network egress and proxy settings (config "proxy" / WHATSAPP_PROXY), then restart.`
+      );
+    }
     console.error(
       `[whatsapp] Failed to fetch latest WA Web version: ${err.message}; ` +
-      `falling back to the Baileys bundled default which may be stale ` +
-      `and can cause pairing failures (405/408)`
+      `resuming the existing registered session with the Baileys bundled default, ` +
+      `which may be stale (fresh pairing would be refused in this state)`
     );
     return undefined;
   }
@@ -96,27 +165,42 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   connectionState = 'connecting';
 
+  // Resolve the proxy BEFORE anything touches the network, so the version
+  // fetch and the socket share the same egress path (datacenter IPs may be
+  // blocked from direct access and require the proxy).
+  const cfg = getConfig();
+  const proxyUrl = cfg.proxy || process.env.WHATSAPP_PROXY;
+  let agent;
+  if (proxyUrl) {
+    const isSocks = proxyUrl.startsWith('socks');
+    agent = isSocks ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
+    console.log(`[whatsapp] Using ${isSocks ? 'SOCKS' : 'HTTP'} proxy: ${proxyUrl.replace(/\/\/.*@/, '//***@')}`);
+  }
+
   // Fetch the authoritative WA Web version and pass it to the socket. Do not
   // pin an old version and do not rely on the Baileys bundled default: WhatsApp
   // rejects new registrations/pairings from stale client builds (405/408, see
-  // WhiskeySockets/Baileys#2679). QR codes are handled via the
-  // connection.update event (printQRInTerminal is deprecated in Baileys 7.x).
-  const waVersion = await resolveWaWebVersion();
+  // WhiskeySockets/Baileys#2679). For fresh auth this is a hard requirement —
+  // resolveWaWebVersion() throws instead of degrading to the bundled default.
+  // QR codes are handled via the connection.update event (printQRInTerminal is
+  // deprecated in Baileys 7.x).
+  const hasRegisteredSession = !!(state.creds?.registered || state.creds?.me?.id);
+  let waVersion;
+  try {
+    waVersion = await resolveWaWebVersion({ agent, required: !hasRegisteredSession });
+  } catch (err) {
+    connectionState = 'disconnected';
+    throw err;
+  }
+
   const socketOpts = { auth: state };
   // Only set the key when resolved: makeWASocket spreads the config over its
   // defaults, so an explicit `version: undefined` would clobber the bundled
   // default instead of falling back to it.
   if (waVersion) socketOpts.version = waVersion;
-
-  // Use SOCKS5 proxy if configured (to bypass datacenter IP blocking)
-  const cfg = getConfig();
-  const proxyUrl = cfg.proxy || process.env.WHATSAPP_PROXY;
-  if (proxyUrl) {
-    const isSocks = proxyUrl.startsWith('socks');
-    const agent = isSocks ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
+  if (agent) {
     socketOpts.agent = agent;
     socketOpts.fetchAgent = agent;
-    console.log(`[whatsapp] Using ${isSocks ? 'SOCKS' : 'HTTP'} proxy: ${proxyUrl.replace(/\/\/.*@/, '//***@')}`);
   }
 
   sock = makeWASocket(socketOpts);
@@ -142,7 +226,13 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
       if (shouldReconnect) {
         setTimeout(() => {
           console.log('[whatsapp] Reconnecting...');
-          connect({ onMessage, onQr, onConnected, onDisconnected });
+          connect({ onMessage, onQr, onConnected, onDisconnected }).catch((err) => {
+            // Same contract as the initial connect() failure in index.js:
+            // surface the error and exit so the process manager restarts us —
+            // the startup path then reports the error in status.json.
+            console.error(`[whatsapp] Fatal reconnection error: ${err.message}`);
+            process.exit(1);
+          });
         }, 5000);
       } else {
         console.log('[whatsapp] Logged out. Delete auth_info to re-auth.');
