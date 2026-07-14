@@ -107,9 +107,10 @@ async function fetchSwJs(agent) {
  *
  * Fetches the current version from web.whatsapp.com through the given proxy
  * agent (same egress as the socket), with an explicit timeout. Behavior on
- * fetch failure depends on whether registration has completed
- * (creds.registered === true — the only proof; creds.me alone is not, as it is
- * set during the pairing-code phase before registration completes):
+ * fetch failure depends on whether pairing/registration has completed
+ * (creds.registered === true, or creds.account which is written only at
+ * pair-success — a real QR pairing leaves registered=false; creds.me alone is
+ * not proof, as it is set during the pairing-code phase before completion):
  * - registration not completed (required=true): throw — pairing with the stale
  *   Baileys bundled version is a known 405/408 failure class, so refuse to
  *   attempt it and surface an actionable error instead.
@@ -119,7 +120,7 @@ async function fetchSwJs(agent) {
  *
  * @param {Object} opts
  * @param {import('http').Agent} [opts.agent] - proxy agent, or undefined for direct
- * @param {boolean} opts.required - true when registration has not completed (creds.registered !== true)
+ * @param {boolean} opts.required - true when pairing/registration has not completed (no creds.registered and no creds.account)
  * @returns {Promise<number[]|undefined>} WA Web version tuple, e.g. [2, 3000, 1043113828]
  */
 async function resolveWaWebVersion({ agent, required }) {
@@ -187,13 +188,15 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   // resolveWaWebVersion() throws instead of degrading to the bundled default.
   // QR codes are handled via the connection.update event (printQRInTerminal is
   // deprecated in Baileys 7.x).
-  // Only creds.registered === true proves registration completed. creds.me is
-  // identity metadata that Baileys sets during the requestPairingCode phase
-  // (Socket/socket.js), BEFORE pairing finishes — registered only flips to true
-  // in Socket/messages-recv.js after pairing completes. Treating me.id as
-  // registration proof would let a half-paired session degrade to the stale
-  // bundled version and hit the 405/408 fresh-pairing failure class.
-  const registrationComplete = state.creds?.registered === true;
+  // Pairing-completion proof: creds.registered === true (pairing-code flow)
+  // OR creds.account present (ADVSignedDeviceIdentity, written only by
+  // configureSuccessfulPairing at pair-success — verified empirically: a real
+  // QR pairing leaves registered=false and sets account). creds.me alone is
+  // NOT proof: Baileys sets it during the requestPairingCode phase
+  // (Socket/socket.js), BEFORE pairing finishes — treating me.id as proof
+  // would let a half-paired session degrade to the stale bundled version and
+  // hit the 405/408 fresh-pairing failure class.
+  const registrationComplete = state.creds?.registered === true || !!state.creds?.account;
   let waVersion;
   try {
     waVersion = await resolveWaWebVersion({ agent, required: !registrationComplete });
