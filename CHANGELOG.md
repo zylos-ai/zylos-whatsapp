@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.2] - 2026-07-14
+
+### Fixed
+- Normalize all line endings to LF and add `.gitattributes` (`* text=auto eol=lf`) to enforce it. The repo was committed with CRLF line endings, which broke zylos-core's SKILL.md frontmatter parsing (its `/^---\n([\s\S]*?)\n---/` regex does not tolerate `\r`): headless `zylos add whatsapp` silently skipped dependency installation, lifecycle hooks, and PM2 service registration, leaving a dependency-less component that crash-looped on `ERR_MODULE_NOT_FOUND` (dotenv). Fresh installs via the platform connect flow were 100% affected; upgrades were not (the upgrade path gates its npm step on `package.json` existence, not on parsed frontmatter).
+
 ## [0.1.1] - 2026-07-14
 
 ### Fixed
