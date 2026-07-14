@@ -1,6 +1,6 @@
 {
   "name": "zylos-whatsapp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WhatsApp communication channel for Zylos via WhatsApp Web protocol",
   "type": "module",
   "main": "src/index.js",
