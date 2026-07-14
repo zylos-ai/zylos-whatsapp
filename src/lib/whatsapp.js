@@ -58,9 +58,11 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   connectionState = 'connecting';
 
-  // Override Baileys hardcoded version to avoid 405 protocol mismatch
-  const WA_VERSION = [2, 3000, 1034074495];
-  const socketOpts = { auth: state, printQRInTerminal: true, version: WA_VERSION };
+  // Use the WA Web version bundled with Baileys. Do not pin an older version
+  // here: WhatsApp rejects new registrations from stale client builds with 405.
+  // QR codes are handled via the connection.update event (printQRInTerminal is
+  // deprecated in Baileys 7.x).
+  const socketOpts = { auth: state };
 
   // Use SOCKS5 proxy if configured (to bypass datacenter IP blocking)
   const cfg = getConfig();
