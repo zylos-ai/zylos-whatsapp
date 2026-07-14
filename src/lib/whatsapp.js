@@ -107,16 +107,19 @@ async function fetchSwJs(agent) {
  *
  * Fetches the current version from web.whatsapp.com through the given proxy
  * agent (same egress as the socket), with an explicit timeout. Behavior on
- * fetch failure depends on whether a registered session exists:
- * - fresh auth (required=true): throw — pairing with the stale Baileys bundled
- *   version is a known 405/408 failure class, so refuse to attempt it and
- *   surface an actionable error instead.
- * - existing session (required=false): return undefined so Baileys resumes the
- *   session with its bundled default — allowed degradation, logged loudly.
+ * fetch failure depends on whether registration has completed
+ * (creds.registered === true — the only proof; creds.me alone is not, as it is
+ * set during the pairing-code phase before registration completes):
+ * - registration not completed (required=true): throw — pairing with the stale
+ *   Baileys bundled version is a known 405/408 failure class, so refuse to
+ *   attempt it and surface an actionable error instead.
+ * - completed registration (required=false): return undefined so Baileys
+ *   resumes the session with its bundled default — allowed degradation,
+ *   logged loudly.
  *
  * @param {Object} opts
  * @param {import('http').Agent} [opts.agent] - proxy agent, or undefined for direct
- * @param {boolean} opts.required - true when no registered session exists (fresh auth)
+ * @param {boolean} opts.required - true when registration has not completed (creds.registered !== true)
  * @returns {Promise<number[]|undefined>} WA Web version tuple, e.g. [2, 3000, 1043113828]
  */
 async function resolveWaWebVersion({ agent, required }) {
@@ -136,8 +139,8 @@ async function resolveWaWebVersion({ agent, required }) {
   } catch (err) {
     if (required) {
       throw new Error(
-        `cannot determine the current WA Web version (${err.message}) and no registered ` +
-        `session exists. Refusing to attempt fresh QR pairing with the stale Baileys ` +
+        `cannot determine the current WA Web version (${err.message}) and no completed ` +
+        `registration exists. Refusing to attempt fresh QR pairing with the stale Baileys ` +
         `bundled version — WhatsApp rejects registrations from stale clients (405/408). ` +
         `Check network egress and proxy settings (config "proxy" / WHATSAPP_PROXY), then restart.`
       );
@@ -184,10 +187,16 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   // resolveWaWebVersion() throws instead of degrading to the bundled default.
   // QR codes are handled via the connection.update event (printQRInTerminal is
   // deprecated in Baileys 7.x).
-  const hasRegisteredSession = !!(state.creds?.registered || state.creds?.me?.id);
+  // Only creds.registered === true proves registration completed. creds.me is
+  // identity metadata that Baileys sets during the requestPairingCode phase
+  // (Socket/socket.js), BEFORE pairing finishes — registered only flips to true
+  // in Socket/messages-recv.js after pairing completes. Treating me.id as
+  // registration proof would let a half-paired session degrade to the stale
+  // bundled version and hit the 405/408 fresh-pairing failure class.
+  const registrationComplete = state.creds?.registered === true;
   let waVersion;
   try {
-    waVersion = await resolveWaWebVersion({ agent, required: !hasRegisteredSession });
+    waVersion = await resolveWaWebVersion({ agent, required: !registrationComplete });
   } catch (err) {
     connectionState = 'disconnected';
     throw err;
