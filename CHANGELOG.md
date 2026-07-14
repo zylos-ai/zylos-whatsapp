@@ -3,7 +3,12 @@
 ## [0.1.1] - 2026-07-14
 
 ### Fixed
-- Bump baileys 7.0.0-rc.9 → 7.0.0-rc13. WhatsApp's servers reject new web-client registrations from the old client build with status 405, so fresh QR pairings hung at "connecting" fleet-wide; existing sessions were unaffected. Also removed the stale hardcoded WA Web version override and the deprecated `printQRInTerminal` option (QR codes are still delivered via the `connection.update` handler). Remediation: after upgrading the component, retry the QR connect.
+- Address fleet-wide 405 rejection of new QR pairings (WhatsApp servers version-gate new web-client registrations; existing sessions were unaffected):
+  - Bump baileys 7.0.0-rc.9 → 7.0.0-rc13.
+  - Remove the stale hardcoded WA Web build pin (`[2, 3000, 1034074495]`).
+  - Fetch the authoritative WA Web version from web.whatsapp.com at connect time (`fetchLatestWaWebVersion`) instead of relying on the Baileys bundled default, which can itself lag and break pairing (see WhiskeySockets/Baileys#2679). If the fetch fails, the connection falls back to the bundled default with a loud error log — never silently.
+  - Drop the deprecated `printQRInTerminal` option; QR codes are still delivered via the `connection.update` handler.
+- Remediation: upgrade the component, then retry QR pairing.
 
 ## [0.1.0] - 2026-03-10
 

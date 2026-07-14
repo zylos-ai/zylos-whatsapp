@@ -4,7 +4,7 @@
  * Handles: QR auth, persistent sessions, message send/receive.
  */
 
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from 'baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestWaWebVersion } from 'baileys';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import path from 'path';
@@ -45,6 +45,44 @@ export function getSelfLid() {
 }
 
 /**
+ * Resolve the WA Web version to advertise to WhatsApp servers.
+ *
+ * Fetches the current version from web.whatsapp.com via Baileys'
+ * fetchLatestWaWebVersion(). On failure it falls back to the Baileys bundled
+ * default — but never silently: the fallback is logged at error level because
+ * a stale version can cause new QR/pairing registrations to be rejected
+ * (405/408).
+ *
+ * @returns {Promise<number[]>} WA Web version tuple, e.g. [2, 3000, 1043113828]
+ */
+async function resolveWaWebVersion() {
+  try {
+    const { version, isLatest, error } = await fetchLatestWaWebVersion();
+    if (error || !isLatest) {
+      // Baileys returns its bundled default version alongside the error
+      const errMsg = error?.message || String(error) || 'unknown error';
+      console.error(
+        `[whatsapp] Failed to fetch latest WA Web version: ${errMsg}; ` +
+        `falling back to Baileys bundled ${version.join('.')} which may be stale ` +
+        `and can cause pairing failures (405/408)`
+      );
+    } else {
+      console.log(`[whatsapp] Using WA Web version ${version.join('.')} (fetched from web.whatsapp.com)`);
+    }
+    return version;
+  } catch (err) {
+    // fetchLatestWaWebVersion should not throw, but guard anyway: let Baileys
+    // use its bundled default by returning undefined — loudly.
+    console.error(
+      `[whatsapp] Failed to fetch latest WA Web version: ${err.message}; ` +
+      `falling back to the Baileys bundled default which may be stale ` +
+      `and can cause pairing failures (405/408)`
+    );
+    return undefined;
+  }
+}
+
+/**
  * Connect to WhatsApp Web
  * @param {Object} options
  * @param {Function} options.onMessage - Callback for incoming messages
@@ -58,11 +96,17 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   connectionState = 'connecting';
 
-  // Use the WA Web version bundled with Baileys. Do not pin an older version
-  // here: WhatsApp rejects new registrations from stale client builds with 405.
-  // QR codes are handled via the connection.update event (printQRInTerminal is
-  // deprecated in Baileys 7.x).
+  // Fetch the authoritative WA Web version and pass it to the socket. Do not
+  // pin an old version and do not rely on the Baileys bundled default: WhatsApp
+  // rejects new registrations/pairings from stale client builds (405/408, see
+  // WhiskeySockets/Baileys#2679). QR codes are handled via the
+  // connection.update event (printQRInTerminal is deprecated in Baileys 7.x).
+  const waVersion = await resolveWaWebVersion();
   const socketOpts = { auth: state };
+  // Only set the key when resolved: makeWASocket spreads the config over its
+  // defaults, so an explicit `version: undefined` would clobber the bundled
+  // default instead of falling back to it.
+  if (waVersion) socketOpts.version = waVersion;
 
   // Use SOCKS5 proxy if configured (to bypass datacenter IP blocking)
   const cfg = getConfig();
