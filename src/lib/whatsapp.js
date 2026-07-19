@@ -15,6 +15,29 @@ import { DATA_DIR, getConfig } from './config.js';
 
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
 
+// Baileys' default per-socket caches are unbounded in 7.0.0-rc13 (upstream
+// bounding PRs #2366/#2533 closed unmerged). TTL-bounded replacements cap
+// growth at traffic-rate × TTL. Deliberately no maxKeys: this cache class
+// throws ECACHEFULL on set when full, which would break Baileys' unguarded
+// cache writes mid-message.
+//
+// Module-scope singletons, created once and shared across reconnects (the
+// upstream-documented pattern for msgRetryCounterCache). Baileys only closes
+// caches it creates itself — caller-provided ones are skipped — and each
+// NodeCache starts a checkperiod interval that retains it, so per-connect()
+// instances would strand five cache+interval pairs on every reconnect cycle.
+// All five are id-keyed content caches for the same account, safe to reuse.
+const sharedCaches = {
+  msgRetryCounterCache: new NodeCache({ stdTTL: 3600, useClones: false }),
+  userDevicesCache: new NodeCache({ stdTTL: 600, useClones: false }),
+  callOfferCache: new NodeCache({ stdTTL: 300, useClones: false }),
+  placeholderResendCache: new NodeCache({ stdTTL: 3600, useClones: false }),
+  mediaCache: new NodeCache({ stdTTL: 300, useClones: false })
+};
+// The checkperiod sweep interval is not unref'd by the library; unref it so
+// short-lived importers (scripts/send.js) can never be held open by it.
+for (const cache of Object.values(sharedCaches)) cache.intervalId?.unref?.();
+
 let sock = null;
 let connectionState = 'disconnected'; // disconnected | connecting | open
 
@@ -225,16 +248,7 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
 
   const socketOpts = {
     auth: state,
-    // Baileys' default per-socket caches are unbounded in 7.0.0-rc13
-    // (upstream bounding PRs #2366/#2533 closed unmerged). TTL-bounded
-    // replacements cap growth at traffic-rate × TTL. Deliberately no
-    // maxKeys: this cache class throws ECACHEFULL on set when full, which
-    // would break Baileys' unguarded cache writes mid-message.
-    msgRetryCounterCache: new NodeCache({ stdTTL: 3600, useClones: false }),
-    userDevicesCache: new NodeCache({ stdTTL: 600, useClones: false }),
-    callOfferCache: new NodeCache({ stdTTL: 300, useClones: false }),
-    placeholderResendCache: new NodeCache({ stdTTL: 3600, useClones: false }),
-    mediaCache: new NodeCache({ stdTTL: 300, useClones: false }),
+    ...sharedCaches,
     // This bot only relays live messages — never buffer full history sync.
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false
