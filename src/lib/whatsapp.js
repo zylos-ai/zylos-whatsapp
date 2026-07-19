@@ -55,8 +55,47 @@ const RECONNECT_MAX_ATTEMPTS = 12;
 const RECONNECT_STABLE_RESET_MS = 60000;
 const TEARDOWN_CLOSE_TIMEOUT_MS = 15000;
 
+// Watchdog (issue #6, mirrors OpenClaw's passive design): no active probe.
+// Baileys already pings every keepAliveIntervalMs and self-terminates after
+// ~interval+5s of frame silence — an active pinger here would double traffic
+// and race teardown. Instead we timestamp every decoded inbound frame (the
+// ws 'frame' event, which Baileys' own keepalive pong refreshes on a healthy
+// link) and only force a reconnect when frames have been stale for far
+// longer than Baileys' own detector needs — i.e. precisely when that
+// detector has died (wedged timer, close event lost). Deliberately no
+// app-level silence signal: this bot can legitimately go hours without
+// messages, so transport staleness is the only trustworthy liveness signal.
+const WATCHDOG_CHECK_MS = 60000;
+const WATCHDOG_TRANSPORT_STALE_MS = 5 * 60000;
+
 let reconnectAttempts = 0;
 let stableResetTimer = null;
+let lastTransportActivity = 0;
+let watchdogTimer = null;
+
+function startWatchdog() {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(() => {
+    if (connectionState !== 'open' || !sock) return;
+    const staleMs = Date.now() - lastTransportActivity;
+    if (staleMs <= WATCHDOG_TRANSPORT_STALE_MS) return;
+    console.warn(`[whatsapp] Watchdog: no transport frames for ${Math.round(staleMs / 1000)}s — forcing reconnect.`);
+    const zombieSock = sock;
+    try {
+      // end() runs Baileys' full close sequence and emits
+      // connection.update close, so the normal reconnect path (teardown
+      // verification + backoff) takes it from here.
+      zombieSock.end(new Error('watchdog: transport stale'));
+    } catch (err) {
+      // Baileys is too wedged even to end() — no in-process recovery path
+      // is trustworthy at this point. Same fatal contract as elsewhere:
+      // exit and let the process manager restart us clean.
+      console.error(`[whatsapp] Watchdog: socket end() failed (${err.message}). Exiting for supervisor restart.`);
+      process.exit(1);
+    }
+  }, WATCHDOG_CHECK_MS);
+  watchdogTimer.unref?.();
+}
 
 /** True once the underlying WebSocket reports fully closed. Duck-typed:
  *  Baileys wraps the raw ws in its own client, so probe the wrapper's
@@ -85,6 +124,7 @@ async function teardownSocket(oldSock) {
   for (const evt of ['connection.update', 'creds.update', 'messages.upsert']) {
     try { oldSock.ev.removeAllListeners(evt); } catch { /* best effort */ }
   }
+  try { oldSock.ws?.removeAllListeners?.('frame'); } catch { /* best effort */ }
   try { oldSock.end(undefined); } catch { /* already closed */ }
   try { oldSock.ws?.close(); } catch { /* already closed */ }
   const deadline = Date.now() + TEARDOWN_CLOSE_TIMEOUT_MS;
@@ -289,7 +329,11 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
     ...sharedCaches,
     // This bot only relays live messages — never buffer full history sync.
     syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false
+    shouldSyncHistoryMessage: () => false,
+    // Slightly under Baileys' 30s default (OpenClaw uses the same value):
+    // keeps the connection inside aggressive NAT idle timeouts, and frame
+    // traffic from the more frequent pong keeps the watchdog signal fresh.
+    keepAliveIntervalMs: 25000
   };
   // Only set the key when resolved: makeWASocket spreads the config over its
   // defaults, so an explicit `version: undefined` would clobber the bundled
@@ -301,6 +345,13 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   }
 
   sock = makeWASocket(socketOpts);
+
+  // Watchdog signal: every decoded inbound frame refreshes the transport
+  // timestamp (Baileys emits 'frame' on its ws client for each one, so the
+  // keepalive pong alone keeps this fresh on a healthy link).
+  lastTransportActivity = Date.now();
+  try { sock.ws?.on?.('frame', () => { lastTransportActivity = Date.now(); }); } catch { /* watchdog degrades to no-op */ }
+  startWatchdog();
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -523,6 +574,9 @@ export function phoneToJid(phone) {
  * Disconnect from WhatsApp
  */
 export async function disconnect() {
+  clearInterval(watchdogTimer);
+  watchdogTimer = null;
+  clearTimeout(stableResetTimer);
   if (sock) {
     // Listeners first: end() re-emits connection.update close, and the
     // close handler must not schedule a reconnect during shutdown.
