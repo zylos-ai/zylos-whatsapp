@@ -41,6 +41,33 @@ for (const cache of Object.values(sharedCaches)) cache.intervalId?.unref?.();
 let sock = null;
 let connectionState = 'disconnected'; // disconnected | connecting | open
 
+// Reconnect policy (issue #5, parameters mirror OpenClaw's connection
+// controller): exponential backoff with jitter so sustained outages don't
+// produce a reconnect storm — every connect() re-reads the full multi-file
+// auth key store, so rapid retries cost real I/O even when they don't leak.
+// At the attempt cap we exit(1) rather than idle disconnected: PM2's own
+// restart/backoff policy takes over, preserving this component's existing
+// fatal-error contract.
+const RECONNECT_INITIAL_DELAY_MS = 2000;
+const RECONNECT_MAX_DELAY_MS = 30000;
+const RECONNECT_BACKOFF_FACTOR = 1.8;
+const RECONNECT_MAX_ATTEMPTS = 12;
+const RECONNECT_STABLE_RESET_MS = 60000;
+const TEARDOWN_CLOSE_TIMEOUT_MS = 15000;
+
+let reconnectAttempts = 0;
+let stableResetTimer = null;
+
+/** True once the underlying WebSocket reports fully closed. Duck-typed:
+ *  Baileys wraps the raw ws in its own client, so probe the wrapper's
+ *  isClosed getter first and fall back to the raw readyState. */
+function wsIsClosed(ws) {
+  if (!ws) return true;
+  if (typeof ws.isClosed === 'boolean') return ws.isClosed;
+  const raw = ws.socket ?? ws;
+  return typeof raw.readyState !== 'number' || raw.readyState === 3; // 3 = CLOSED
+}
+
 /**
  * Tear down a socket before abandoning it. Every reconnect used to create a
  * new socket while the old one kept its keepalive timer, ws listeners,
@@ -48,14 +75,25 @@ let connectionState = 'disconnected'; // disconnected | connecting | open
  * that connect() call's full in-memory auth key store) — stranding the whole
  * old socket graph on every reconnect cycle. Our listeners must go first so
  * end()'s re-emitted connection.update cannot re-enter the reconnect path.
+ *
+ * Resolves once the WebSocket is verified closed, or after a bounded wait
+ * (issue #6): callers that create a replacement socket await this so an
+ * undead old socket never briefly overlaps the new one.
  */
-function teardownSocket(oldSock) {
+async function teardownSocket(oldSock) {
   if (!oldSock) return;
   for (const evt of ['connection.update', 'creds.update', 'messages.upsert']) {
     try { oldSock.ev.removeAllListeners(evt); } catch { /* best effort */ }
   }
   try { oldSock.end(undefined); } catch { /* already closed */ }
   try { oldSock.ws?.close(); } catch { /* already closed */ }
+  const deadline = Date.now() + TEARDOWN_CLOSE_TIMEOUT_MS;
+  while (!wsIsClosed(oldSock.ws) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!wsIsClosed(oldSock.ws)) {
+    console.warn(`[whatsapp] Old WebSocket still not closed after ${TEARDOWN_CLOSE_TIMEOUT_MS / 1000}s; proceeding anyway.`);
+  }
 }
 
 /**
@@ -275,6 +313,9 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
 
     if (connection === 'close') {
       connectionState = 'disconnected';
+      // A connection that bounced before the stability window elapsed does
+      // not count as stable — keep the accumulated attempt count.
+      clearTimeout(stableResetTimer);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -283,10 +324,28 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
       if (onDisconnected) onDisconnected(statusCode);
 
       const closedSock = sock;
-      teardownSocket(closedSock);
       if (sock === closedSock) sock = null;
 
-      if (shouldReconnect) {
+      if (!shouldReconnect) {
+        teardownSocket(closedSock);
+        console.log('[whatsapp] Logged out. Delete auth_info to re-auth.');
+        return;
+      }
+
+      reconnectAttempts += 1;
+      if (reconnectAttempts > RECONNECT_MAX_ATTEMPTS) {
+        console.error(`[whatsapp] ${RECONNECT_MAX_ATTEMPTS} consecutive reconnect attempts without a stable connection. Exiting for supervisor restart.`);
+        process.exit(1);
+      }
+      const backoff = Math.min(
+        RECONNECT_INITIAL_DELAY_MS * RECONNECT_BACKOFF_FACTOR ** (reconnectAttempts - 1),
+        RECONNECT_MAX_DELAY_MS
+      );
+      const delay = Math.round(backoff + Math.random() * 0.25 * backoff);
+      console.log(`[whatsapp] Reconnect attempt ${reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS} in ${(delay / 1000).toFixed(1)}s`);
+
+      // Old socket must be verified closed before the replacement is created.
+      teardownSocket(closedSock).then(() => {
         setTimeout(() => {
           console.log('[whatsapp] Reconnecting...');
           connect({ onMessage, onQr, onConnected, onDisconnected }).catch((err) => {
@@ -296,13 +355,22 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
             console.error(`[whatsapp] Fatal reconnection error: ${err.message}`);
             process.exit(1);
           });
-        }, 5000);
-      } else {
-        console.log('[whatsapp] Logged out. Delete auth_info to re-auth.');
-      }
+        }, delay);
+      });
     } else if (connection === 'open') {
       connectionState = 'open';
       console.log(`[whatsapp] Connected as ${sock.user?.id}`);
+      // Only a connection that survives the stability window clears the
+      // retry budget — sporadic disconnects never exhaust it, sustained
+      // flapping still reaches the cap.
+      clearTimeout(stableResetTimer);
+      stableResetTimer = setTimeout(() => {
+        if (reconnectAttempts > 0) {
+          console.log('[whatsapp] Connection stable, reconnect counter reset.');
+          reconnectAttempts = 0;
+        }
+      }, RECONNECT_STABLE_RESET_MS);
+      stableResetTimer.unref?.();
       if (onConnected) onConnected(sock.user);
     }
   });
@@ -458,8 +526,9 @@ export async function disconnect() {
   if (sock) {
     // Listeners first: end() re-emits connection.update close, and the
     // close handler must not schedule a reconnect during shutdown.
-    teardownSocket(sock);
+    const oldSock = sock;
     sock = null;
     connectionState = 'disconnected';
+    await teardownSocket(oldSock);
   }
 }
