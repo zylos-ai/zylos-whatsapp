@@ -5,6 +5,7 @@
  */
 
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from 'baileys';
+import { NodeCache } from '@cacheable/node-cache';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import https from 'https';
@@ -14,8 +15,48 @@ import { DATA_DIR, getConfig } from './config.js';
 
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
 
+// Baileys' default per-socket caches are unbounded in 7.0.0-rc13 (upstream
+// bounding PRs #2366/#2533 closed unmerged). TTL-bounded replacements cap
+// growth at traffic-rate × TTL. Deliberately no maxKeys: this cache class
+// throws ECACHEFULL on set when full, which would break Baileys' unguarded
+// cache writes mid-message.
+//
+// Module-scope singletons, created once and shared across reconnects (the
+// upstream-documented pattern for msgRetryCounterCache). Baileys only closes
+// caches it creates itself — caller-provided ones are skipped — and each
+// NodeCache starts a checkperiod interval that retains it, so per-connect()
+// instances would strand five cache+interval pairs on every reconnect cycle.
+// All five are id-keyed content caches for the same account, safe to reuse.
+const sharedCaches = {
+  msgRetryCounterCache: new NodeCache({ stdTTL: 3600, useClones: false }),
+  userDevicesCache: new NodeCache({ stdTTL: 600, useClones: false }),
+  callOfferCache: new NodeCache({ stdTTL: 300, useClones: false }),
+  placeholderResendCache: new NodeCache({ stdTTL: 3600, useClones: false }),
+  mediaCache: new NodeCache({ stdTTL: 300, useClones: false })
+};
+// The checkperiod sweep interval is not unref'd by the library; unref it so
+// short-lived importers (scripts/send.js) can never be held open by it.
+for (const cache of Object.values(sharedCaches)) cache.intervalId?.unref?.();
+
 let sock = null;
 let connectionState = 'disconnected'; // disconnected | connecting | open
+
+/**
+ * Tear down a socket before abandoning it. Every reconnect used to create a
+ * new socket while the old one kept its keepalive timer, ws listeners,
+ * signal-repository caches, and our handler closures (each closure retains
+ * that connect() call's full in-memory auth key store) — stranding the whole
+ * old socket graph on every reconnect cycle. Our listeners must go first so
+ * end()'s re-emitted connection.update cannot re-enter the reconnect path.
+ */
+function teardownSocket(oldSock) {
+  if (!oldSock) return;
+  for (const evt of ['connection.update', 'creds.update', 'messages.upsert']) {
+    try { oldSock.ev.removeAllListeners(evt); } catch { /* best effort */ }
+  }
+  try { oldSock.end(undefined); } catch { /* already closed */ }
+  try { oldSock.ws?.close(); } catch { /* already closed */ }
+}
 
 /**
  * Get the current socket instance
@@ -205,7 +246,13 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
     throw err;
   }
 
-  const socketOpts = { auth: state };
+  const socketOpts = {
+    auth: state,
+    ...sharedCaches,
+    // This bot only relays live messages — never buffer full history sync.
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false
+  };
   // Only set the key when resolved: makeWASocket spreads the config over its
   // defaults, so an explicit `version: undefined` would clobber the bundled
   // default instead of falling back to it.
@@ -234,6 +281,10 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
       console.log(`[whatsapp] Connection closed. Status: ${statusCode}. Reconnect: ${shouldReconnect}`);
 
       if (onDisconnected) onDisconnected(statusCode);
+
+      const closedSock = sock;
+      teardownSocket(closedSock);
+      if (sock === closedSock) sock = null;
 
       if (shouldReconnect) {
         setTimeout(() => {
@@ -405,7 +456,9 @@ export function phoneToJid(phone) {
  */
 export async function disconnect() {
   if (sock) {
-    sock.end(undefined);
+    // Listeners first: end() re-emits connection.update close, and the
+    // close handler must not schedule a reconnect during shutdown.
+    teardownSocket(sock);
     sock = null;
     connectionState = 'disconnected';
   }
