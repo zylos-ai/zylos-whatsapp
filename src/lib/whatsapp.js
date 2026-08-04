@@ -247,7 +247,32 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
           });
         }, 5000);
       } else {
-        console.log('[whatsapp] Logged out. Delete auth_info to re-auth.');
+        // Baileys' own DisconnectReason.loggedOut is a definitive signal from
+        // WhatsApp that this session is dead — there is nothing left to
+        // preserve. Left in place, the next connect() (triggered by a pm2
+        // restart from a user-initiated reconnect) would call
+        // useMultiFileAuthState on these same revoked credentials and attempt
+        // session RESUMPTION instead of fresh pairing, hitting the identical
+        // loggedOut failure again — the process never reaches a state that
+        // emits a QR code, so "reconnect" silently does nothing forever.
+        console.log('[whatsapp] Logged out. Clearing auth_info and starting a fresh QR pairing.');
+        try {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        } catch (err) {
+          console.error(`[whatsapp] Failed to clear auth_info after logout: ${err.message}`);
+        }
+        // Reconnect immediately (auth_info is now empty, so this is a fresh
+        // pairing, not the resumption attempt that just failed) instead of
+        // waiting for an external pm2 restart to trigger the next attempt —
+        // the customer's "Connect" click already asked for a new QR; no need
+        // to make them wait through another full connector-dispatch round trip.
+        setTimeout(() => {
+          console.log('[whatsapp] Starting fresh pairing after logout...');
+          connect({ onMessage, onQr, onConnected, onDisconnected }).catch((err) => {
+            console.error(`[whatsapp] Fatal reconnection error: ${err.message}`);
+            process.exit(1);
+          });
+        }, 5000);
       }
     } else if (connection === 'open') {
       connectionState = 'open';

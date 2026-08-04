@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.3] - 2026-08-04
+
+### Fixed
+- **Reconnect after a WhatsApp-side logout never generated a new QR code.**
+  On `DisconnectReason.loggedOut`, the `connection.update` handler only
+  logged a message telling an operator to delete `auth_info` manually — it
+  never did so itself, and never reconnected. The next start (triggered by a
+  pm2 restart from cws-connect's channel-reconnect dispatch) called
+  `useMultiFileAuthState` on the same already-revoked credentials and
+  attempted session *resumption* instead of fresh pairing, hitting the
+  identical `loggedOut` failure again — the process never reached a state
+  that emits a QR, so a customer clicking "Connect" on a logged-out WhatsApp
+  channel got no QR code, silently, forever.
+  - `loggedOut` now clears `auth_info/` immediately (this is WhatsApp's own
+    definitive "this session is dead" signal — there is nothing left in it
+    worth preserving) and reconnects after the same 5s backoff already used
+    for the retryable-disconnect path, so the next attempt is a genuine fresh
+    QR pairing rather than a doomed resumption attempt.
+  - No behavior change for any other disconnect reason — only the
+    previously-dead-end `loggedOut` branch is affected.
+
 ## [0.1.2] - 2026-07-14
 
 ### Fixed
