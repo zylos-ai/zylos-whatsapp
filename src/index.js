@@ -15,7 +15,9 @@ import QRCode from 'qrcode';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig, watchConfig, saveConfig, stopWatching, DATA_DIR } from './lib/config.js';
-import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedia, getSelfJid, getSelfLid } from './lib/whatsapp.js';
+import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedia, getSelfJid, getSelfLid,
+  sendText, sendImage, sendDocument } from './lib/whatsapp.js';
+import { startSendServer, createSendHandler } from './lib/ipc.js';
 
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 const INTERNAL_TOKEN = crypto.randomBytes(24).toString('hex');
@@ -271,6 +273,24 @@ async function handleMessage(msg) {
 }
 
 // ============================================================
+// Outbound send socket
+// ============================================================
+// Short-lived CLI processes (scripts/send.js) must not open their own Baileys
+// connection: WhatsApp treats a second registration from the same auth as the
+// device being replaced and terminates this process's stream, so every outbound
+// message would knock the listener offline. They hand the send to us instead.
+let sendServer = null;
+
+function startSendSocket() {
+  // onConnected fires again after each reconnect; keep the first server.
+  if (sendServer) return;
+  sendServer = startSendServer({
+    log: (msg) => console.log(msg),
+    onRequest: createSendHandler({ sendText, sendImage, sendDocument }),
+  });
+}
+
+// ============================================================
 // Main startup
 // ============================================================
 console.log(`[whatsapp] Starting...`);
@@ -302,6 +322,7 @@ connect({
     // Remove stale QR file
     try { fs.unlinkSync(QR_FILE); } catch { /* ignore */ }
     console.log(`[whatsapp] Successfully connected as ${user?.id}`);
+    startSendSocket();
   },
   onDisconnected: (statusCode) => {
     writeStatus('disconnected', { statusCode });
@@ -314,13 +335,13 @@ connect({
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+function shutdown() {
   console.log('[whatsapp] Shutting down...');
   stopWatching();
+  // Remove the socket so a restarting service does not inherit a dead one and
+  // send.js does not try a socket nobody is listening on.
+  if (sendServer) sendServer.close();
   process.exit(0);
-});
-process.on('SIGTERM', () => {
-  console.log('[whatsapp] Shutting down...');
-  stopWatching();
-  process.exit(0);
-});
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

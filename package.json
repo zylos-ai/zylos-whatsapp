@@ -1,12 +1,13 @@
 {
   "name": "zylos-whatsapp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "WhatsApp communication channel for Zylos via WhatsApp Web protocol",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "admin": "node src/admin.js"
+    "admin": "node src/admin.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=20.0.0"

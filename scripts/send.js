@@ -18,6 +18,7 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig } from '../src/lib/config.js';
 import { sendText, sendImage, sendDocument } from '../src/lib/whatsapp.js';
+import { requestSend, IpcUnavailableError } from '../src/lib/ipc.js';
 
 const MAX_LENGTH = 4000;
 
@@ -92,11 +93,41 @@ async function main() {
   const { chatId } = parseEndpoint(rawEndpoint);
   const media = parseMedia(message);
 
+  const chunks = media ? null : chunkMessage(message, MAX_LENGTH);
+
+  // Preferred path: hand the send to the resident service, which already holds
+  // the WhatsApp session. Opening a second Baileys connection here (the old
+  // behaviour) makes WhatsApp treat the device as replaced and terminates the
+  // resident listener's stream, so every outbound message used to knock the
+  // receiver offline for several seconds.
   try {
-    // Need to connect first — import and initialize
+    if (media) {
+      await requestSend({ kind: media.type === 'image' ? 'image' : 'file', chatId, path: media.path });
+      console.log(`[whatsapp] Media sent to ${chatId} (via resident service)`);
+    } else {
+      for (let i = 0; i < chunks.length; i++) {
+        await requestSend({ kind: 'text', chatId, text: chunks[i] });
+        if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
+      }
+      console.log(`[whatsapp] Text sent to ${chatId} (${chunks.length} chunk(s), via resident service)`);
+    }
+    process.exit(0);
+  } catch (err) {
+    if (!(err instanceof IpcUnavailableError)) {
+      // The service answered, and it failed — retrying inline would create the
+      // session conflict this path exists to avoid.
+      console.error(`[whatsapp] Send failed: ${err.message}`);
+      process.exit(1);
+    }
+    console.error(`[whatsapp] Resident service unavailable (${err.message}); connecting inline`);
+  }
+
+  // Fallback: no resident service (fresh install, service stopped, mid-restart).
+  // Correct but disruptive if the service comes back up mid-send, so it is only
+  // used when there is nothing to disrupt.
+  try {
     const { connect, getConnectionState } = await import('../src/lib/whatsapp.js');
 
-    // Wait for connection (send.js is a short-lived process, so we connect inline)
     if (getConnectionState() !== 'open') {
       await connect({});
       // Wait up to 15s for connection
@@ -116,14 +147,13 @@ async function main() {
       } else {
         await sendDocument(chatId, media.path);
       }
-      console.log(`[whatsapp] Media sent to ${chatId}`);
+      console.log(`[whatsapp] Media sent to ${chatId} (inline)`);
     } else {
-      const chunks = chunkMessage(message, MAX_LENGTH);
       for (const chunk of chunks) {
         await sendText(chatId, chunk);
         if (chunks.length > 1) await new Promise(r => setTimeout(r, 500));
       }
-      console.log(`[whatsapp] Text sent to ${chatId} (${chunks.length} chunk(s))`);
+      console.log(`[whatsapp] Text sent to ${chatId} (${chunks.length} chunk(s), inline)`);
     }
 
     process.exit(0);
