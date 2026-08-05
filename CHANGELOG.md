@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.3.0] - 2026-08-05
+
+### Fixed
+- **Every outbound message knocked the resident listener offline.** WhatsApp Web
+  allows one active session per device registration. `scripts/send.js` opened its
+  own Baileys connection from the same `auth_info/` on each send, so WhatsApp
+  answered the second registration by sending
+  `stream:error / conflict: type=replaced` to the connection that already
+  existed — terminating the service's stream and losing inbound messages for the
+  ~4s it took to reconnect. Observed on a live host as a 1:1 correlation: five
+  sends, five conflict-and-reconnect cycles, each 2-3 seconds after the send.
+
+  Outbound now goes through a local Unix socket (`send.sock`, owner-only,
+  authenticated with the existing `.internal-token`) to the process that already
+  holds the session. `send.js` connects inline **only** when nothing is listening
+  (fresh install, service stopped, mid-restart) — i.e. when there is no session
+  to disrupt. A failure reported *by* the service is not retried inline, since
+  that would recreate the conflict.
+
+  This is also the most likely cause of "reconnect needs two QR scans, the second
+  fails" reports: repeated conflicting registrations against one credential set.
+
+### Added
+- `src/lib/ipc.js` — send socket server/client plus `createSendHandler()`.
+- `npm test` — `node --test` suite covering the send-socket contract (9 tests):
+  round-trip delivery, media payloads, owner-only socket mode, service-reported
+  failures surfacing as real errors rather than "unavailable", request
+  validation, and stale-socket recovery after a crash.
+
+### Changed
+- `CLAUDE.md` documents the one-session-per-registration constraint and the rule
+  that short-lived processes must not open a Baileys connection while the service
+  is running.
+
 ## [0.2.1] - 2026-08-04
 
 ### Fixed
