@@ -5,6 +5,7 @@
  */
 
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from 'baileys';
+import { NodeCache } from '@cacheable/node-cache';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import https from 'https';
@@ -14,8 +15,126 @@ import { DATA_DIR, getConfig } from './config.js';
 
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
 
+// Baileys' default per-socket caches are unbounded in 7.0.0-rc13 (upstream
+// bounding PRs #2366/#2533 closed unmerged). TTL-bounded replacements cap
+// growth at traffic-rate × TTL. Deliberately no maxKeys: this cache class
+// throws ECACHEFULL on set when full, which would break Baileys' unguarded
+// cache writes mid-message.
+//
+// Module-scope singletons, created once and shared across reconnects (the
+// upstream-documented pattern for msgRetryCounterCache). Baileys only closes
+// caches it creates itself — caller-provided ones are skipped — and each
+// NodeCache starts a checkperiod interval that retains it, so per-connect()
+// instances would strand five cache+interval pairs on every reconnect cycle.
+// All five are id-keyed content caches for the same account, safe to reuse.
+const sharedCaches = {
+  msgRetryCounterCache: new NodeCache({ stdTTL: 3600, useClones: false }),
+  userDevicesCache: new NodeCache({ stdTTL: 600, useClones: false }),
+  callOfferCache: new NodeCache({ stdTTL: 300, useClones: false }),
+  placeholderResendCache: new NodeCache({ stdTTL: 3600, useClones: false }),
+  mediaCache: new NodeCache({ stdTTL: 300, useClones: false })
+};
+// The checkperiod sweep interval is not unref'd by the library; unref it so
+// short-lived importers (scripts/send.js) can never be held open by it.
+for (const cache of Object.values(sharedCaches)) cache.intervalId?.unref?.();
+
 let sock = null;
 let connectionState = 'disconnected'; // disconnected | connecting | open
+
+// Reconnect policy (issue #5, parameters mirror OpenClaw's connection
+// controller): exponential backoff with jitter so sustained outages don't
+// produce a reconnect storm — every connect() re-reads the full multi-file
+// auth key store, so rapid retries cost real I/O even when they don't leak.
+// At the attempt cap we exit(1) rather than idle disconnected: PM2's own
+// restart/backoff policy takes over, preserving this component's existing
+// fatal-error contract.
+const RECONNECT_INITIAL_DELAY_MS = 2000;
+const RECONNECT_MAX_DELAY_MS = 30000;
+const RECONNECT_BACKOFF_FACTOR = 1.8;
+const RECONNECT_MAX_ATTEMPTS = 12;
+const RECONNECT_STABLE_RESET_MS = 60000;
+const TEARDOWN_CLOSE_TIMEOUT_MS = 15000;
+
+// Watchdog (issue #6, mirrors OpenClaw's passive design): no active probe.
+// Baileys already pings every keepAliveIntervalMs and self-terminates after
+// ~interval+5s of frame silence — an active pinger here would double traffic
+// and race teardown. Instead we timestamp every decoded inbound frame (the
+// ws 'frame' event, which Baileys' own keepalive pong refreshes on a healthy
+// link) and only force a reconnect when frames have been stale for far
+// longer than Baileys' own detector needs — i.e. precisely when that
+// detector has died (wedged timer, close event lost). Deliberately no
+// app-level silence signal: this bot can legitimately go hours without
+// messages, so transport staleness is the only trustworthy liveness signal.
+const WATCHDOG_CHECK_MS = 60000;
+const WATCHDOG_TRANSPORT_STALE_MS = 5 * 60000;
+
+let reconnectAttempts = 0;
+let stableResetTimer = null;
+let lastTransportActivity = 0;
+let watchdogTimer = null;
+
+function startWatchdog() {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(() => {
+    if (connectionState !== 'open' || !sock) return;
+    const staleMs = Date.now() - lastTransportActivity;
+    if (staleMs <= WATCHDOG_TRANSPORT_STALE_MS) return;
+    console.warn(`[whatsapp] Watchdog: no transport frames for ${Math.round(staleMs / 1000)}s — forcing reconnect.`);
+    const zombieSock = sock;
+    try {
+      // end() runs Baileys' full close sequence and emits
+      // connection.update close, so the normal reconnect path (teardown
+      // verification + backoff) takes it from here.
+      zombieSock.end(new Error('watchdog: transport stale'));
+    } catch (err) {
+      // Baileys is too wedged even to end() — no in-process recovery path
+      // is trustworthy at this point. Same fatal contract as elsewhere:
+      // exit and let the process manager restart us clean.
+      console.error(`[whatsapp] Watchdog: socket end() failed (${err.message}). Exiting for supervisor restart.`);
+      process.exit(1);
+    }
+  }, WATCHDOG_CHECK_MS);
+  watchdogTimer.unref?.();
+}
+
+/** True once the underlying WebSocket reports fully closed. Duck-typed:
+ *  Baileys wraps the raw ws in its own client, so probe the wrapper's
+ *  isClosed getter first and fall back to the raw readyState. */
+function wsIsClosed(ws) {
+  if (!ws) return true;
+  if (typeof ws.isClosed === 'boolean') return ws.isClosed;
+  const raw = ws.socket ?? ws;
+  return typeof raw.readyState !== 'number' || raw.readyState === 3; // 3 = CLOSED
+}
+
+/**
+ * Tear down a socket before abandoning it. Every reconnect used to create a
+ * new socket while the old one kept its keepalive timer, ws listeners,
+ * signal-repository caches, and our handler closures (each closure retains
+ * that connect() call's full in-memory auth key store) — stranding the whole
+ * old socket graph on every reconnect cycle. Our listeners must go first so
+ * end()'s re-emitted connection.update cannot re-enter the reconnect path.
+ *
+ * Resolves once the WebSocket is verified closed, or after a bounded wait
+ * (issue #6): callers that create a replacement socket await this so an
+ * undead old socket never briefly overlaps the new one.
+ */
+async function teardownSocket(oldSock) {
+  if (!oldSock) return;
+  for (const evt of ['connection.update', 'creds.update', 'messages.upsert']) {
+    try { oldSock.ev.removeAllListeners(evt); } catch { /* best effort */ }
+  }
+  try { oldSock.ws?.removeAllListeners?.('frame'); } catch { /* best effort */ }
+  try { oldSock.end(undefined); } catch { /* already closed */ }
+  try { oldSock.ws?.close(); } catch { /* already closed */ }
+  const deadline = Date.now() + TEARDOWN_CLOSE_TIMEOUT_MS;
+  while (!wsIsClosed(oldSock.ws) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!wsIsClosed(oldSock.ws)) {
+    console.warn(`[whatsapp] Old WebSocket still not closed after ${TEARDOWN_CLOSE_TIMEOUT_MS / 1000}s; proceeding anyway.`);
+  }
+}
 
 /**
  * Get the current socket instance
@@ -205,7 +324,17 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
     throw err;
   }
 
-  const socketOpts = { auth: state };
+  const socketOpts = {
+    auth: state,
+    ...sharedCaches,
+    // This bot only relays live messages — never buffer full history sync.
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,
+    // Slightly under Baileys' 30s default (OpenClaw uses the same value):
+    // keeps the connection inside aggressive NAT idle timeouts, and frame
+    // traffic from the more frequent pong keeps the watchdog signal fresh.
+    keepAliveIntervalMs: 25000
+  };
   // Only set the key when resolved: makeWASocket spreads the config over its
   // defaults, so an explicit `version: undefined` would clobber the bundled
   // default instead of falling back to it.
@@ -216,6 +345,13 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
   }
 
   sock = makeWASocket(socketOpts);
+
+  // Watchdog signal: every decoded inbound frame refreshes the transport
+  // timestamp (Baileys emits 'frame' on its ws client for each one, so the
+  // keepalive pong alone keeps this fresh on a healthy link).
+  lastTransportActivity = Date.now();
+  try { sock.ws?.on?.('frame', () => { lastTransportActivity = Date.now(); }); } catch { /* watchdog degrades to no-op */ }
+  startWatchdog();
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -228,6 +364,9 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
 
     if (connection === 'close') {
       connectionState = 'disconnected';
+      // A connection that bounced before the stability window elapsed does
+      // not count as stable — keep the accumulated attempt count.
+      clearTimeout(stableResetTimer);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -235,18 +374,10 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
 
       if (onDisconnected) onDisconnected(statusCode);
 
-      if (shouldReconnect) {
-        setTimeout(() => {
-          console.log('[whatsapp] Reconnecting...');
-          connect({ onMessage, onQr, onConnected, onDisconnected }).catch((err) => {
-            // Same contract as the initial connect() failure in index.js:
-            // surface the error and exit so the process manager restarts us —
-            // the startup path then reports the error in status.json.
-            console.error(`[whatsapp] Fatal reconnection error: ${err.message}`);
-            process.exit(1);
-          });
-        }, 5000);
-      } else {
+      const closedSock = sock;
+      if (sock === closedSock) sock = null;
+
+      if (!shouldReconnect) {
         // Baileys' own DisconnectReason.loggedOut is a definitive signal from
         // WhatsApp that this session is dead — there is nothing left to
         // preserve. Left in place, the next connect() (triggered by a pm2
@@ -261,22 +392,63 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
         } catch (err) {
           console.error(`[whatsapp] Failed to clear auth_info after logout: ${err.message}`);
         }
-        // Reconnect immediately (auth_info is now empty, so this is a fresh
-        // pairing, not the resumption attempt that just failed) instead of
-        // waiting for an external pm2 restart to trigger the next attempt —
-        // the customer's "Connect" click already asked for a new QR; no need
-        // to make them wait through another full connector-dispatch round trip.
+        // Same bounded teardown as the retryable path below (verify the old
+        // socket is actually closed before a replacement is created) — auth_info
+        // is now empty, so this is a fresh pairing, not the resumption attempt
+        // that just failed. Fixed short delay, not the exponential backoff
+        // budget: this is a deliberate one-shot fresh-pairing kick, not a
+        // flaky-connection retry, so it does not touch reconnectAttempts.
+        teardownSocket(closedSock).then(() => {
+          setTimeout(() => {
+            console.log('[whatsapp] Starting fresh pairing after logout...');
+            connect({ onMessage, onQr, onConnected, onDisconnected }).catch((err) => {
+              console.error(`[whatsapp] Fatal reconnection error: ${err.message}`);
+              process.exit(1);
+            });
+          }, 5000);
+        });
+        return;
+      }
+
+      reconnectAttempts += 1;
+      if (reconnectAttempts > RECONNECT_MAX_ATTEMPTS) {
+        console.error(`[whatsapp] ${RECONNECT_MAX_ATTEMPTS} consecutive reconnect attempts without a stable connection. Exiting for supervisor restart.`);
+        process.exit(1);
+      }
+      const backoff = Math.min(
+        RECONNECT_INITIAL_DELAY_MS * RECONNECT_BACKOFF_FACTOR ** (reconnectAttempts - 1),
+        RECONNECT_MAX_DELAY_MS
+      );
+      const delay = Math.round(backoff + Math.random() * 0.25 * backoff);
+      console.log(`[whatsapp] Reconnect attempt ${reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS} in ${(delay / 1000).toFixed(1)}s`);
+
+      // Old socket must be verified closed before the replacement is created.
+      teardownSocket(closedSock).then(() => {
         setTimeout(() => {
-          console.log('[whatsapp] Starting fresh pairing after logout...');
+          console.log('[whatsapp] Reconnecting...');
           connect({ onMessage, onQr, onConnected, onDisconnected }).catch((err) => {
+            // Same contract as the initial connect() failure in index.js:
+            // surface the error and exit so the process manager restarts us —
+            // the startup path then reports the error in status.json.
             console.error(`[whatsapp] Fatal reconnection error: ${err.message}`);
             process.exit(1);
           });
-        }, 5000);
-      }
+        }, delay);
+      });
     } else if (connection === 'open') {
       connectionState = 'open';
       console.log(`[whatsapp] Connected as ${sock.user?.id}`);
+      // Only a connection that survives the stability window clears the
+      // retry budget — sporadic disconnects never exhaust it, sustained
+      // flapping still reaches the cap.
+      clearTimeout(stableResetTimer);
+      stableResetTimer = setTimeout(() => {
+        if (reconnectAttempts > 0) {
+          console.log('[whatsapp] Connection stable, reconnect counter reset.');
+          reconnectAttempts = 0;
+        }
+      }, RECONNECT_STABLE_RESET_MS);
+      stableResetTimer.unref?.();
       if (onConnected) onConnected(sock.user);
     }
   });
@@ -429,9 +601,15 @@ export function phoneToJid(phone) {
  * Disconnect from WhatsApp
  */
 export async function disconnect() {
+  clearInterval(watchdogTimer);
+  watchdogTimer = null;
+  clearTimeout(stableResetTimer);
   if (sock) {
-    sock.end(undefined);
+    // Listeners first: end() re-emits connection.update close, and the
+    // close handler must not schedule a reconnect during shutdown.
+    const oldSock = sock;
     sock = null;
     connectionState = 'disconnected';
+    await teardownSocket(oldSock);
   }
 }

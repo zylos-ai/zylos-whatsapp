@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.3] - 2026-08-04
+## [0.2.1] - 2026-08-04
 
 ### Fixed
 - **Reconnect after a WhatsApp-side logout never generated a new QR code.**
@@ -15,11 +15,29 @@
   channel got no QR code, silently, forever.
   - `loggedOut` now clears `auth_info/` immediately (this is WhatsApp's own
     definitive "this session is dead" signal — there is nothing left in it
-    worth preserving) and reconnects after the same 5s backoff already used
-    for the retryable-disconnect path, so the next attempt is a genuine fresh
-    QR pairing rather than a doomed resumption attempt.
+    worth preserving) and reconnects through the same hardened path already
+    used for the retryable-disconnect case (bounded teardown, shared caches,
+    exponential backoff), so the next attempt is a genuine fresh QR pairing
+    rather than a doomed resumption attempt.
   - No behavior change for any other disconnect reason — only the
-    previously-dead-end `loggedOut` branch is affected.
+    previously-dead-end `loggedOut` branch is affected. Built on top of the
+    v0.2.0 reconnect-hardening work below, not a replacement for it.
+
+## [0.2.0] - 2026-07-19
+
+### Fixed
+- Memory leak on reconnect (#3, PR #4): every `Reconnecting...` cycle leaked the previous socket and its caches, growing RSS by tens of MB per reconnect (150-200MB/hr on unstable networks) until OOM.
+  - Tear down the old socket before creating a new one: remove all event listeners, end the WebSocket, and drop references (`teardownSocket`).
+  - Share Baileys caches (msg retry counter, media conn, user devices, placeholder resend) as module-scope singletons across reconnects instead of creating per-connect instances — caller-provided NodeCaches were retained forever by their `checkperiod` timers even after the socket died. Raise the `@cacheable/node-cache` floor to `^1.7.6` (1.4.0 lacks the named `NodeCache` export and crashes at boot).
+  - Add a PM2 `max_memory_restart: '1G'` backstop for residual growth from upstream Baileys issues (WhiskeySockets/Baileys#2090 per-entry LID cache timers, #2666 per-socket AsyncLocalStorage) that cannot be fixed component-side.
+  - Live validation (same-PID SIGSTOP/CONT reconnect test, 5 cycles): +6MB total (~1.2MB/cycle, upstream residual) vs. tens of MB per cycle before the fix.
+
+### Added
+- Reconnect hardening (#5, #6, PR #7), modeled on OpenClaw's connection controller and verified against Baileys 7.0.0-rc13 source:
+  - Exponential reconnect backoff: 2s → 30s cap (×1.8 growth, ±25% jitter), 12-attempt limit, then `exit(1)` so PM2 takes over with a clean process. The counter resets only after the connection stays stable for 60s.
+  - Bounded close verification: teardown now polls (up to 15s) until the old WebSocket is actually closed before a replacement socket is created, preventing two live sockets racing on the same auth state.
+  - Passive transport watchdog: tracks WebSocket `frame` timestamps; if no frame arrives for 5 minutes (meaning Baileys' own keepalive self-check — which pings every 25-30s and self-terminates after ~35s of silence — has itself died), forces the reconnect path via `sock.end()`, escalating to `exit(1)` if the socket is wedged. Deliberately passive: no active probing, no duplicate ping traffic, no race with teardown.
+  - Tighten `keepAliveIntervalMs` to 25s (OpenClaw's value) to survive aggressive NAT idle timeouts.
 
 ## [0.1.2] - 2026-07-14
 
