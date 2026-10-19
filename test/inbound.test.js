@@ -8,7 +8,7 @@ import os from 'os';
 import path from 'path';
 
 import {
-  shouldBindOwner, messageTimestampMs, buildReplyVia, c4SendPath, OWNER_BIND_GRACE_MS
+  shouldBindOwner, isPrivateUserJid, messageTimestampMs, buildReplyVia, c4SendPath, OWNER_BIND_GRACE_MS
 } from '../src/lib/inbound.js';
 
 const CONNECTED_AT = 1_760_000_000_000; // epoch ms
@@ -18,6 +18,8 @@ function live(overrides = {}) {
   return {
     ownerBound: false,
     isGroup: false,
+    chatJid: '8613800138000@s.whatsapp.net',
+    senderJid: '8613800138000@s.whatsapp.net',
     upsertType: 'notify',
     requestId: undefined,
     messageTimestamp: sec(CONNECTED_AT + 5000),
@@ -25,6 +27,23 @@ function live(overrides = {}) {
     ...overrides
   };
 }
+
+describe('isPrivateUserJid', () => {
+  it('accepts phone-number and LID user JIDs, with or without device suffix', () => {
+    for (const jid of ['8613800138000@s.whatsapp.net', '8613800138000:12@s.whatsapp.net',
+      '123456789012345@lid', '123456789012345:3@lid']) {
+      assert.equal(isPrivateUserJid(jid), true, jid);
+    }
+  });
+
+  it('rejects groups, newsletters, broadcasts, status and junk', () => {
+    for (const jid of ['120363000000000000@g.us', '120363000000000000@newsletter',
+      'status@broadcast', '1234567890@broadcast', '1234@call', 'abc@s.whatsapp.net',
+      '', null, undefined]) {
+      assert.equal(isPrivateUserJid(jid), false, String(jid));
+    }
+  });
+});
 
 describe('shouldBindOwner', () => {
   it('binds on a real-time DM received after the connection opened', () => {
@@ -102,5 +121,30 @@ describe('reply-via path', () => {
     const expected = path.join(os.homedir(), 'zylos/.claude/skills/comm-bridge/scripts/c4-send.js');
     assert.equal(c4SendPath(), expected);
     assert.ok(buildReplyVia('e').startsWith(`node ${expected} `));
+  });
+});
+
+describe('shouldBindOwner: non-person chats never bind', () => {
+  it('a fresh live @newsletter message does not bind', () => {
+    const jid = '120363000000000000@newsletter';
+    assert.equal(shouldBindOwner(live({ chatJid: jid, senderJid: jid })), false);
+  });
+
+  it('a fresh live @broadcast message does not bind', () => {
+    const jid = '1234567890@broadcast';
+    assert.equal(shouldBindOwner(live({ chatJid: jid, senderJid: jid })), false);
+  });
+
+  it('newsletter arrives first, then a real person DM still binds the person', () => {
+    let ownerBound = false;
+    const nl = '120363000000000000@newsletter';
+    if (shouldBindOwner(live({ ownerBound, chatJid: nl, senderJid: nl }))) ownerBound = true;
+    assert.equal(ownerBound, false);
+    assert.equal(shouldBindOwner(live({ ownerBound })), true);
+  });
+
+  it('a LID private DM binds', () => {
+    const jid = '123456789012345@lid';
+    assert.equal(shouldBindOwner(live({ chatJid: jid, senderJid: jid })), true);
   });
 });

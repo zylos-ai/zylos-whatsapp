@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- **Owner could be auto-bound to a newsletter or broadcast sender.** The
+  auto-bind gate only excluded groups, so a fresh live `@newsletter` or
+  `@broadcast` message could become owner and lock out real people. Binding now
+  requires both the chat and the sender to be a private user JID
+  (`@s.whatsapp.net` or `@lid`).
 - **Owner could be auto-bound to a stranger from replayed messages.** With no
   owner bound, the first incoming DM's sender became owner — including messages
   delivered after linking that were not live (offline backlog, delivered by

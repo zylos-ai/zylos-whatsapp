@@ -191,6 +191,8 @@ async function handleMessage(msg, meta = {}) {
   if (shouldBindOwner({
     ownerBound: !!config.owner?.bound,
     isGroup: isGroupMsg,
+    chatJid,
+    senderJid,
     upsertType: meta.upsertType,
     requestId: meta.requestId,
     messageTimestamp: msg.messageTimestamp,
