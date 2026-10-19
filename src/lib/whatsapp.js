@@ -40,6 +40,9 @@ for (const cache of Object.values(sharedCaches)) cache.intervalId?.unref?.();
 
 let sock = null;
 let connectionState = 'disconnected'; // disconnected | connecting | open
+// Epoch ms when the current connection reached 'open' (0 when not open).
+// Used to tell live messages from backlog for owner auto-bind.
+let connectedAt = 0;
 
 // Reconnect policy (issue #5, parameters mirror OpenClaw's connection
 // controller): exponential backoff with jitter so sustained outages don't
@@ -148,6 +151,13 @@ export function getSocket() {
  */
 export function getConnectionState() {
   return connectionState;
+}
+
+/**
+ * Epoch ms when the current connection opened, or 0 if not connected.
+ */
+export function getConnectedAt() {
+  return connectedAt;
 }
 
 /**
@@ -287,6 +297,7 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   connectionState = 'connecting';
+  connectedAt = 0;
 
   // Resolve the proxy BEFORE anything touches the network, so the version
   // fetch and the socket share the same egress path (datacenter IPs may be
@@ -364,6 +375,7 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
 
     if (connection === 'close') {
       connectionState = 'disconnected';
+      connectedAt = 0;
       // A connection that bounced before the stability window elapsed does
       // not count as stable — keep the accumulated attempt count.
       clearTimeout(stableResetTimer);
@@ -437,6 +449,7 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
       });
     } else if (connection === 'open') {
       connectionState = 'open';
+      connectedAt = Date.now();
       console.log(`[whatsapp] Connected as ${sock.user?.id}`);
       // Only a connection that survives the stability window clears the
       // retry budget — sporadic disconnects never exhaust it, sustained
@@ -471,7 +484,9 @@ export async function connect({ onMessage, onQr, onConnected, onDisconnected }) 
       if (!msg.message) continue;
 
       try {
-        await onMessage(msg);
+        // Pass the upsert type through: 'notify' = real-time, 'append' =
+        // offline backlog / replays. Owner auto-bind depends on it.
+        await onMessage(msg, { upsertType: event.type, requestId: event.requestId });
       } catch (err) {
         console.error(`[whatsapp] Error handling message: ${err.message}`);
       }
