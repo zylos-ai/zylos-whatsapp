@@ -16,7 +16,8 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig, watchConfig, saveConfig, stopWatching, DATA_DIR } from './lib/config.js';
 import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedia, getSelfJid, getSelfLid,
-  sendText, sendImage, sendDocument } from './lib/whatsapp.js';
+  getConnectedAt, sendText, sendImage, sendDocument } from './lib/whatsapp.js';
+import { shouldBindOwner, buildReplyVia } from './lib/inbound.js';
 import { startSendServer, createSendHandler } from './lib/ipc.js';
 
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -157,8 +158,11 @@ function checkAccess(config, senderJid, chatJid, isGroupMsg) {
 
 /**
  * Handle incoming message
+ *
+ * @param {object} msg - Baileys WebMessageInfo
+ * @param {object} [meta] - { upsertType, requestId } from the messages.upsert event
  */
-async function handleMessage(msg) {
+async function handleMessage(msg, meta = {}) {
   const messageId = msg.key.id;
   if (isDuplicate(messageId)) return;
 
@@ -182,8 +186,18 @@ async function handleMessage(msg) {
     if (isSelf && !isSelfChat) return;
   }
 
-  // Owner auto-bind (first DM)
-  if (!config.owner?.bound && !isGroupMsg) {
+  // Owner auto-bind (first *live* DM). Offline backlog / replayed / pre-connect
+  // messages still flow through the normal path below but never bind.
+  if (shouldBindOwner({
+    ownerBound: !!config.owner?.bound,
+    isGroup: isGroupMsg,
+    chatJid,
+    senderJid,
+    upsertType: meta.upsertType,
+    requestId: meta.requestId,
+    messageTimestamp: msg.messageTimestamp,
+    connectedAt: getConnectedAt()
+  })) {
     const phone = jidToPhone(senderJid);
     config.owner = {
       bound: true,
@@ -261,7 +275,7 @@ async function handleMessage(msg) {
   } catch { /* ignore */ }
 
   // Send to C4
-  const replyVia = `node /home/owen/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "whatsapp" "${endpoint}"`;
+  const replyVia = buildReplyVia(endpoint);
   const fullContent = `${c4Content} ---- reply via: ${replyVia}`;
 
   try {

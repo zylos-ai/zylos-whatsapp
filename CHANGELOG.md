@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.1] - 2026-10-20
+
+### Fixed
+- **Owner could be auto-bound to a newsletter or broadcast sender.** The
+  auto-bind gate only excluded groups, so a fresh live `@newsletter` or
+  `@broadcast` message could become owner and lock out real people. Binding now
+  requires both the chat and the sender to be a private user JID
+  (`@s.whatsapp.net` or `@lid`).
+- **Owner could be auto-bound to a stranger from replayed messages.** With no
+  owner bound, the first incoming DM's sender became owner — including messages
+  delivered after linking that were not live (offline backlog, delivered by
+  Baileys as `messages.upsert` type `append`). Under the default
+  `dmPolicy: owner` that stranger kept ownership and every later sender was
+  "Access denied". Auto-bind now happens only for a real-time DM: upsert type
+  `notify`, not a placeholder-resend replay (`requestId` set), and stamped no
+  earlier than the current connection's open time (60s clock-skew grace). It
+  fails closed when the timestamp or connection time is unknown. Non-live
+  messages still go through normal access control; they just never bind.
+- **Reply path was hardcoded to `/home/owen/`.** The `reply via:` command
+  attached to forwarded messages is now built from `os.homedir()`, so replies
+  work on hosts where the service user is not `owen`. (Fixes #11)
+
+### Added
+- `src/lib/inbound.js` — pure helpers `shouldBindOwner()` and `buildReplyVia()`,
+  with `test/inbound.test.js` covering them.
+
 ## [0.3.0] - 2026-08-05
 
 ### Fixed
