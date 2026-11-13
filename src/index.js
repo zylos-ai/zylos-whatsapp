@@ -18,9 +18,12 @@ import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedi
   getConnectedAt, sendText, sendImage, sendDocument } from './lib/whatsapp.js';
 import { shouldBindOwner, buildReplyVia } from './lib/inbound.js';
 import { sendToC4 } from './lib/c4.js';
+import { createChatNotifier } from './lib/notice.js';
+import { generateMessageIDV2 } from 'baileys';
 import { startSendServer, createSendHandler } from './lib/ipc.js';
 
-const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const C4_RECEIVE = path.join(process.env.ZYLOS_DIR || path.join(process.env.HOME, 'zylos'),
+  '.claude/skills/comm-bridge/scripts/c4-receive.js');
 const INTERNAL_TOKEN = crypto.randomBytes(24).toString('hex');
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 const STATUS_FILE = path.join(DATA_DIR, 'status.json');
@@ -62,6 +65,13 @@ function isDuplicate(messageId) {
   processedMessages.set(messageId, Date.now());
   return false;
 }
+
+// Tells a chat when the agent will not answer; its own echo is marked as processed.
+const notifyChat = createChatNotifier({
+  sendText,
+  markOwnMessage: (messageId) => processedMessages.set(messageId, Date.now()),
+  generateId: () => generateMessageIDV2(getSelfJid() || undefined)
+});
 
 // Periodic cleanup of dedup map
 setInterval(() => {
@@ -264,11 +274,8 @@ async function handleMessage(msg, meta = {}) {
   if (result.outcome === 'sent') {
     console.log(`[whatsapp] Message from ${senderName} forwarded to C4`);
   } else if (result.notice) {
-    try {
-      await sendText(chatJid, result.notice);
-    } catch (err) {
-      console.error(`[whatsapp] Failed to send notice to ${chatJid}: ${err.message}`);
-    }
+    // In a group, quote the message the notice is about.
+    await notifyChat({ chatJid, text: result.notice, quoted: isGroupMsg ? msg : undefined });
   }
 }
 

@@ -66,7 +66,8 @@ function neverStarted(error) {
  * c4-receive runs without a timeout: Core may still be routing the message or
  * sending a status notice after storing it, and it has no inbound idempotency
  * key. A call that is stored or whose outcome is unknown is never retried;
- * only a call that never started is retried once.
+ * only a call that never started is retried once (if it never starts, nothing
+ * was stored). NUL bytes are removed from the content.
  *
  * @returns {Promise<{ outcome: 'sent'|'committed'|'not_stored'|'uncertain', notice: string|null }>}
  *   `notice` is the text to send the WhatsApp chat, or null to send nothing.
@@ -79,8 +80,9 @@ export async function sendToC4({
   retryDelayMs = 2000,
   logger = console
 }) {
+  const safeContent = String(content).replace(/\0/g, '');
   for (let attempt = 1; ; attempt += 1) {
-    const args = [c4Receive, '--channel', 'whatsapp', '--endpoint', endpoint, '--content', content];
+    const args = [c4Receive, '--channel', 'whatsapp', '--endpoint', endpoint, '--content', safeContent];
     let sessionGroup;
     if (c4ReceiveSupportsOption(c4Receive, '--session-group')) {
       try {
@@ -94,9 +96,9 @@ export async function sendToC4({
 
     const { error, invalidArgs, stdout } = await new Promise((resolve) => {
       try {
-        execFileImpl('node', args, { encoding: 'utf8' }, (err, out) => resolve({ error: err, stdout: out }));
+        execFileImpl(process.execPath, args, { encoding: 'utf8' }, (err, out) => resolve({ error: err, stdout: out }));
       } catch (err) {
-        // Invalid arguments (e.g. a NUL byte in the content) throw before spawning.
+        // Invalid arguments (e.g. a NUL byte in the endpoint) throw before spawning.
         resolve({ error: err, invalidArgs: true });
       }
     });
@@ -119,9 +121,13 @@ export async function sendToC4({
 
     if (!error) return { outcome: 'sent', notice: null };
 
-    if (!neverStarted(error) || attempt >= 2) {
+    if (!neverStarted(error)) {
       logger.error(`[whatsapp] C4 receive failed, outcome unknown, not resending: ${error.message}`);
       return { outcome: 'uncertain', notice: UNCERTAIN_REPLY };
+    }
+    if (attempt >= 2) {
+      logger.error(`[whatsapp] C4 receive did not start after retry, not stored: ${error.message}`);
+      return { outcome: 'not_stored', notice: GENERIC_REJECT_REPLY };
     }
 
     logger.warn(`[whatsapp] C4 receive did not start, retrying in ${retryDelayMs}ms: ${error.message}`);

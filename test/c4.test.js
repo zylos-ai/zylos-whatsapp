@@ -2,7 +2,7 @@
  * Tests for sending inbound messages to Core (c4-receive) with an injected execFile.
  */
 
-import { afterEach, describe, it } from 'node:test';
+import { after, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
@@ -29,7 +29,7 @@ const spawnFailure = () => ({ error: Object.assign(new Error('spawn node ENOENT'
 function run(results, endpoint = ENDPOINT) {
   const calls = [];
   const execFileImpl = (cmd, args, options, cb) => {
-    calls.push({ args, options });
+    calls.push({ cmd, args, options });
     const result = results[Math.min(calls.length - 1, results.length - 1)];
     setImmediate(() => cb(result.error ?? null, result.stdout ?? '', ''));
   };
@@ -41,6 +41,7 @@ const multiSession = () => fs.writeFileSync(manifestPath,
   JSON.stringify({ options: { '--json': { takesValue: false }, '--session-group': { takesValue: true } } }));
 
 afterEach(() => fs.rmSync(manifestPath, { force: true }));
+after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 describe('sendToC4', () => {
   it('older Core receives exactly the pre-change arguments, even for unmappable endpoints', async () => {
@@ -66,6 +67,7 @@ describe('sendToC4', () => {
     assert.deepEqual(result, { outcome: 'sent', notice: null });
     assert.deepEqual(calls[0].args, NEW_ARGS);
     assert.equal(calls[0].options.timeout, undefined);
+    assert.equal(calls[0].cmd, process.execPath);
   });
 
   it('unmappable endpoint on multi-session Core is never sent', async () => {
@@ -97,8 +99,9 @@ describe('sendToC4', () => {
     assert.deepEqual(ok.result, { outcome: 'sent', notice: null });
     assert.deepEqual(ok.calls.map((c) => c.args), [NEW_ARGS, NEW_ARGS]);
 
+    // Never started twice: nothing was stored, so "try again later".
     const failed = await run([spawnFailure(), spawnFailure()]);
-    assert.deepEqual(failed.result, { outcome: 'uncertain', notice: UNCERTAIN_REPLY });
+    assert.deepEqual(failed.result, { outcome: 'not_stored', notice: GENERIC_REJECT_REPLY });
     assert.equal(failed.calls.length, 2);
   });
 
@@ -111,5 +114,15 @@ describe('sendToC4', () => {
     });
     assert.deepEqual(result, { outcome: 'not_stored', notice: GENERIC_REJECT_REPLY });
     assert.equal(calls, 1);
+  });
+
+  it('removes NUL bytes from the content instead of failing the message', async () => {
+    const calls = [];
+    const result = await sendToC4({
+      c4Receive, endpoint: ENDPOINT, content: 'a\0b', logger: quiet,
+      execFileImpl: (cmd, args, options, cb) => { calls.push(args); setImmediate(() => cb(null, '', '')); }
+    });
+    assert.equal(result.outcome, 'sent');
+    assert.equal(calls[0][calls[0].indexOf('--content') + 1], 'ab');
   });
 });

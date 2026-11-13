@@ -28,6 +28,10 @@ const INVALID = [
   '8613800138000|type:p2p|msg:x',                     // no '@'
   '8613800138000:12@s.whatsapp.net|type:p2p|msg:x',   // device suffix: ':' is ambiguous
   'a@b@c|type:p2p|msg:x',                             // two '@'
+  '120363012345678901@newsletter|type:p2p|msg:x',     // newsletter is not a person
+  'status@broadcast|type:p2p|msg:x',
+  '120363012345678901@g.us|type:p2p|msg:x',           // group JID as a DM
+  '8613800138000@s.whatsapp.net|type:group|msg:x',    // person JID as a group
   '|type:p2p|msg:x',
   `${'1'.repeat(80)}@s.whatsapp.net|type:p2p`,        // over 95 characters, never truncated
 ];
