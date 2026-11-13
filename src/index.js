@@ -6,7 +6,6 @@
  */
 
 import dotenv from 'dotenv';
-import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -18,9 +17,13 @@ import { getConfig, watchConfig, saveConfig, stopWatching, DATA_DIR } from './li
 import { connect, extractText, getMessageType, isGroup, jidToPhone, downloadMedia, getSelfJid, getSelfLid,
   getConnectedAt, sendText, sendImage, sendDocument } from './lib/whatsapp.js';
 import { shouldBindOwner, buildReplyVia } from './lib/inbound.js';
+import { sendToC4 } from './lib/c4.js';
+import { createChatNotifier } from './lib/notice.js';
+import { generateMessageIDV2 } from 'baileys';
 import { startSendServer, createSendHandler } from './lib/ipc.js';
 
-const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const C4_RECEIVE = path.join(process.env.ZYLOS_DIR || path.join(process.env.HOME, 'zylos'),
+  '.claude/skills/comm-bridge/scripts/c4-receive.js');
 const INTERNAL_TOKEN = crypto.randomBytes(24).toString('hex');
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 const STATUS_FILE = path.join(DATA_DIR, 'status.json');
@@ -63,6 +66,13 @@ function isDuplicate(messageId) {
   return false;
 }
 
+// Tells a chat when the agent will not answer; its own echo is marked as processed.
+const notifyChat = createChatNotifier({
+  sendText,
+  markOwnMessage: (messageId) => processedMessages.set(messageId, Date.now()),
+  generateId: () => generateMessageIDV2(getSelfJid() || undefined)
+});
+
 // Periodic cleanup of dedup map
 setInterval(() => {
   const now = Date.now();
@@ -91,24 +101,6 @@ function cacheUserName(jid, name) {
 
 function sanitizeFileName(name) {
   return path.basename(String(name || 'file')).replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
-}
-
-/**
- * Send message to C4 bridge
- */
-function sendToC4(channel, endpoint, content) {
-  return new Promise((resolve, reject) => {
-    execFile('node', [C4_RECEIVE, '--channel', channel, '--endpoint', endpoint, '--content', content], {
-      timeout: 30000
-    }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[whatsapp] C4 receive error: ${err.message}`);
-        reject(err);
-      } else {
-        resolve(stdout);
-      }
-    });
-  });
 }
 
 /**
@@ -278,11 +270,12 @@ async function handleMessage(msg, meta = {}) {
   const replyVia = buildReplyVia(endpoint);
   const fullContent = `${c4Content} ---- reply via: ${replyVia}`;
 
-  try {
-    await sendToC4('whatsapp', endpoint, fullContent);
+  const result = await sendToC4({ c4Receive: C4_RECEIVE, endpoint, content: fullContent });
+  if (result.outcome === 'sent') {
     console.log(`[whatsapp] Message from ${senderName} forwarded to C4`);
-  } catch (err) {
-    console.error(`[whatsapp] Failed to forward to C4: ${err.message}`);
+  } else if (result.notice) {
+    // In a group, quote the message the notice is about.
+    await notifyChat({ chatJid, text: result.notice, quoted: isGroupMsg ? msg : undefined });
   }
 }
 
