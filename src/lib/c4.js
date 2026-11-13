@@ -92,9 +92,18 @@ export async function sendToC4({
       args.push('--json', '--session-group', sessionGroup);
     }
 
-    const { error, stdout } = await new Promise((resolve) => {
-      execFileImpl('node', args, { encoding: 'utf8' }, (err, out) => resolve({ error: err, stdout: out }));
+    const { error, invalidArgs, stdout } = await new Promise((resolve) => {
+      try {
+        execFileImpl('node', args, { encoding: 'utf8' }, (err, out) => resolve({ error: err, stdout: out }));
+      } catch (err) {
+        // Invalid arguments (e.g. a NUL byte in the content) throw before spawning.
+        resolve({ error: err, invalidArgs: true });
+      }
     });
+    if (invalidArgs) {
+      logger.error(`[whatsapp] C4 receive could not start (invalid arguments), not stored: ${error.message}`);
+      return { outcome: 'not_stored', notice: GENERIC_REJECT_REPLY };
+    }
     const response = sessionGroup ? parseC4Response(stdout) : null;
 
     if (response && response.ok === false && response.error) {

@@ -101,4 +101,15 @@ describe('sendToC4', () => {
     assert.deepEqual(failed.result, { outcome: 'uncertain', notice: UNCERTAIN_REPLY });
     assert.equal(failed.calls.length, 2);
   });
+
+  it('content c4-receive cannot be started with (NUL byte) is reported, not thrown or retried', async () => {
+    multiSession();
+    let calls = 0;
+    const result = await sendToC4({
+      c4Receive, endpoint: ENDPOINT, content: 'a\0b', retryDelayMs: 1, logger: quiet,
+      execFileImpl: () => { calls += 1; throw Object.assign(new TypeError('null bytes'), { code: 'ERR_INVALID_ARG_VALUE' }); }
+    });
+    assert.deepEqual(result, { outcome: 'not_stored', notice: GENERIC_REJECT_REPLY });
+    assert.equal(calls, 1);
+  });
 });
