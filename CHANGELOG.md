@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.4.0] - 2026-11-20
+
+### Added
+- **Session groups for multi-session Core.** Each private chat and group is
+  delivered to Core in its own session group:
+
+  | Conversation | Endpoint | Session group |
+  |---|---|---|
+  | Private chat (phone) | `<n>@s.whatsapp.net\|type:p2p\|msg:<id>` | `dm-<n>:s.whatsapp.net` |
+  | Private chat (LID) | `<n>@lid\|type:p2p\|msg:<id>` | `dm-<n>:lid` |
+  | Group | `<id>@g.us\|type:group\|msg:<id>` | `group-<id>:g.us` |
+
+  The JID keeps its domain with `@` written as `:`, so a phone-number chat and a
+  LID chat stay distinct; it is never truncated or hashed. `--session-group` and
+  `--json` are passed only when `c4-receive-options.json` lists
+  `--session-group`, so an older Core receives exactly the same arguments as
+  before. Endpoints that cannot be mapped are not sent (never to the overall
+  group). `scripts/session-group.js <endpoint>` prints the group for an endpoint.
+- **The chat is told when Core will not take a message** (previously only
+  logged). A "try again later" or "may not have reached me" notice is sent at
+  most once per chat per 5 minutes, quoting the message in groups; nothing is
+  sent when Core already stored the message.
+- `src/lib/c4.js`, `src/lib/session-group.js`, `src/lib/notice.js`, with
+  `test/c4.test.js`, `test/session-group.test.js` and `test/notice.test.js`.
+
+### Changed
+- **C4 delivery.** The 30s timeout is removed and a delivery is retried only
+  when the c4-receive process never started. On a multi-session Core a
+  rejection is classified by `error.persisted`; on an older Core any failure is
+  treated as an unknown outcome. An argument error (e.g. a NUL byte) is
+  reported instead of thrown.
+
+### Fixed
+- **Messages sent to the bot's own chat came back as new inbound messages.**
+  Sends through the send socket went out without a pre-chosen message id, so
+  Baileys' echo of a self-chat message was processed as if someone had written
+  it. The id is now generated and marked processed before each text, image or
+  file send, the same way chat notices already were.
+
 ## [0.3.1] - 2026-10-20
 
 ### Fixed
