@@ -144,6 +144,58 @@ describe('send IPC', () => {
     }
   });
 
+  describe('own-message marking (self-chat echo)', () => {
+    // Baileys emits our own sends back as messages, and self-chat messages are
+    // not skipped, so each send's id must be marked processed before it is sent.
+    function recordingHandler() {
+      const events = [];
+      let n = 0;
+      const record = (kind) => async (...args) => events.push({ kind, args });
+      const handler = createSendHandler({
+        sendText: record('sendText'),
+        sendImage: record('sendImage'),
+        sendDocument: record('sendDocument'),
+        generateId: () => `ID-${++n}`,
+        markOwnMessage: (id) => events.push({ kind: 'mark', id }),
+      });
+      return { handler, events };
+    }
+
+    const cases = [
+      { kind: 'text', payload: { text: 'hi' }, sender: 'sendText', optionsIndex: 2 },
+      { kind: 'image', payload: { path: '/tmp/x.png' }, sender: 'sendImage', optionsIndex: 3 },
+      { kind: 'file', payload: { path: '/tmp/x.pdf' }, sender: 'sendDocument', optionsIndex: 3 },
+    ];
+
+    for (const c of cases) {
+      it(`marks the ${c.kind} message id before sending and sends with that id`, async () => {
+        const { handler, events } = recordingHandler();
+        await handler({ kind: c.kind, chatId: 'self@s.whatsapp.net', ...c.payload });
+        assert.equal(events.length, 2);
+        assert.deepEqual(events[0], { kind: 'mark', id: 'ID-1' }, 'id must be marked before the send');
+        assert.equal(events[1].kind, c.sender);
+        assert.equal(events[1].args[0], 'self@s.whatsapp.net');
+        assert.equal(events[1].args[1], Object.values(c.payload)[0]);
+        assert.equal(events[1].args[c.optionsIndex]?.messageId, 'ID-1',
+          `${c.sender} must receive the marked id as options.messageId`);
+      });
+    }
+
+    it('generates a fresh id per send', async () => {
+      const { handler, events } = recordingHandler();
+      await handler({ kind: 'text', chatId: 'a@s.whatsapp.net', text: 'one' });
+      await handler({ kind: 'text', chatId: 'a@s.whatsapp.net', text: 'two' });
+      const ids = events.filter((e) => e.kind === 'mark').map((e) => e.id);
+      assert.deepEqual(ids, ['ID-1', 'ID-2']);
+    });
+
+    it('does not mark anything for a rejected request', async () => {
+      const { handler, events } = recordingHandler();
+      await assert.rejects(() => handler({ kind: 'text', chatId: 'a@s.whatsapp.net', text: '' }));
+      assert.equal(events.length, 0);
+    });
+  });
+
   after(() => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });

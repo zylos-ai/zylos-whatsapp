@@ -293,7 +293,14 @@ function startSendSocket() {
   if (sendServer) return;
   sendServer = startSendServer({
     log: (msg) => console.log(msg),
-    onRequest: createSendHandler({ sendText, sendImage, sendDocument }),
+    // Sends to our own chat echo back as inbound; mark their ids as processed.
+    onRequest: createSendHandler({
+      sendText,
+      sendImage,
+      sendDocument,
+      markOwnMessage: (messageId) => processedMessages.set(messageId, Date.now()),
+      generateId: () => generateMessageIDV2(getSelfJid() || undefined)
+    }),
   });
 }
 
