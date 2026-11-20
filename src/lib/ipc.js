@@ -150,10 +150,27 @@ export function startSendServer({ onRequest, log = () => {} }) {
  * Kept here (with the senders injected) so the request contract can be tested
  * without importing src/index.js, which connects to WhatsApp on import.
  *
- * @param {{ sendText: Function, sendImage: Function, sendDocument: Function }} senders
+ * When `generateId` and `markOwnMessage` are given, each send's message id is
+ * chosen up front and marked as already processed before sending, so the echo
+ * Baileys emits for our own messages (self-chat messages are not skipped) is
+ * not handled as a new inbound message.
+ *
+ * @param {object} deps
+ * @param {Function} deps.sendText - `(jid, text, options)`
+ * @param {Function} deps.sendImage - `(jid, path, caption, options)`
+ * @param {Function} deps.sendDocument - `(jid, path, filename, options)`
+ * @param {(messageId: string) => void} [deps.markOwnMessage] - register an id as already handled
+ * @param {() => string} [deps.generateId] - WhatsApp message id generator
  * @returns {(payload: object) => Promise<object>}
  */
-export function createSendHandler({ sendText, sendImage, sendDocument }) {
+export function createSendHandler({ sendText, sendImage, sendDocument, markOwnMessage, generateId }) {
+  const ownMessageOptions = () => {
+    if (!generateId || !markOwnMessage) return {};
+    const messageId = generateId();
+    markOwnMessage(messageId);
+    return { messageId };
+  };
+
   return async function handleSendRequest(payload) {
     const { kind, chatId } = payload || {};
     if (!chatId) throw new Error('chatId is required');
@@ -162,16 +179,16 @@ export function createSendHandler({ sendText, sendImage, sendDocument }) {
         if (typeof payload.text !== 'string' || payload.text === '') {
           throw new Error('text is required');
         }
-        await sendText(chatId, payload.text);
+        await sendText(chatId, payload.text, ownMessageOptions());
         return { kind: 'text' };
       }
       case 'image':
         if (!payload.path) throw new Error('path is required');
-        await sendImage(chatId, payload.path);
+        await sendImage(chatId, payload.path, undefined, ownMessageOptions());
         return { kind: 'image' };
       case 'file':
         if (!payload.path) throw new Error('path is required');
-        await sendDocument(chatId, payload.path);
+        await sendDocument(chatId, payload.path, undefined, ownMessageOptions());
         return { kind: 'file' };
       default:
         throw new Error(`unsupported kind: ${kind}`);
