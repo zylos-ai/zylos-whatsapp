@@ -19,6 +19,7 @@ Communication component using WhatsApp Web protocol via Baileys library.
 - `src/lib/config.js` — Config loader with hot-reload
 - `src/lib/whatsapp.js` — Baileys wrapper (connect, send, receive)
 - `src/lib/ipc.js` — Local send socket (resident service ↔ short-lived CLI processes)
+- `src/lib/mime.js` — Pure MIME helpers for outbound documents (extension → MIME type)
 - `scripts/send.js` — C4 outbound message interface
 - `test/` — `node --test` suite (`npm test`)
 - `hooks/` — Lifecycle hooks (post-install, pre-upgrade, post-upgrade)

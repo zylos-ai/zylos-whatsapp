@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.2] - 2026-11-25
+
+### Fixed
+- **Documents arrived as `.bin`.** `sendDocument()` always sent
+  `application/octet-stream`, so WhatsApp showed PDFs, Office files and other
+  documents to the recipient as `.bin`. The MIME type now comes from the file's
+  extension (the display filename's if it has one, otherwise the path's) via
+  `documentMimeType()` in `src/lib/mime.js`; unknown or missing extensions still
+  fall back to `application/octet-stream`. The file name is unchanged.
+
 ## [0.3.1] - 2026-10-20
 
 ### Fixed

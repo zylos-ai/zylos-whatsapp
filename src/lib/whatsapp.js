@@ -12,6 +12,7 @@ import https from 'https';
 import path from 'path';
 import fs from 'fs';
 import { DATA_DIR, getConfig } from './config.js';
+import { documentMimeType } from './mime.js';
 
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
 
@@ -532,10 +533,9 @@ export async function sendImage(jid, imagePath, caption, options = {}) {
  */
 export async function sendDocument(jid, filePath, filename, options = {}) {
   if (!sock) throw new Error('Not connected');
-  const mime = 'application/octet-stream';
   return sock.sendMessage(jid, {
     document: { url: filePath },
-    mimetype: mime,
+    mimetype: documentMimeType(filePath, filename),
     fileName: filename || path.basename(filePath)
   }, options);
 }
